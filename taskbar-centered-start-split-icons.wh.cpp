@@ -4,9 +4,11 @@
 // @description     Pins the Start button to the true horizontal center of the screen, and splits running-app taskbar buttons into two groups flanking it based on which side of the screen each window is currently on (Windows 11 only)
 // @version         0.1.0
 // @author          rick
+// @github          https://github.com/rycalvo
 // @include         explorer.exe
 // @architecture    x86-64
 // @compilerOptions -lcomctl32 -ldwmapi -lole32 -loleaut32 -lruntimeobject -lshcore
+// @license         GPL-3.0
 // ==/WindhawkMod==
 
 // Source code is published under The GNU General Public License v3.0.
