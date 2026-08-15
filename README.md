@@ -51,6 +51,7 @@ right next to Start on whichever side you prefer.
 ## Changelog
 
 **Initial build (Aug 2026)**
+
 - Start button pinned to the primary monitor's true center, independent of
   the number of taskbar icons.
 - Running-app icons split left/right of Start by live window position, with
@@ -68,6 +69,7 @@ right next to Start on whichever side you prefer.
   and Widgets can sit at the far-left edge or adjacent to Start.
 
 **Feature follow-ups**
+
 - Support for "Combine taskbar buttons: Always" (grouped icons bind to a
   different internal view model than individual windows, so this needed
   its own resolution path).
@@ -83,6 +85,7 @@ right next to Start on whichever side you prefer.
   edge of their side, or right next to Start.
 
 **Stability: cross-monitor moves**
+
 Moving a window to a second monitor repeatedly crashed explorer.exe across
 several iterations, each surfacing a different unsafe call path within the
 same underlying class of bug: a synchronous WinRT/XAML call made while the
@@ -106,6 +109,7 @@ fully close it. Fixes along the way:
   were still unsafe mid-mutation.
 
 **Settling-window polish**
+
 Once crash-free, the settling window itself produced two follow-on cosmetic
 issues, both fixed the same day:
 - The Start button no longer keeps re-centering while its neighbors are held
@@ -120,5 +124,6 @@ issues, both fixed the same day:
   and only lets a genuinely new button show up unpositioned - much less
   visually distracting on ordinary events like opening a new app.
 
-  **Disclosures**
-  I am not a software developer. The present mod was developed using the Claude Code extension in VS Code. I cannot verify the external integrity of this mod on other systems and do not take responsibility for issues that may arise for its use.
+ ## Disclosures
+  
+I am not a software developer. The present mod was developed using the Claude Code extension in VS Code. I cannot verify the external integrity of this mod on other systems and do not take responsibility for issues that may arise for its use. This mod was created for my own interests and shared for targeted development by members of the Windhawk community.
