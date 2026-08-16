@@ -1138,15 +1138,20 @@ struct ButtonClassification {
 
 // Classification priority: explicit user override by app name, then live
 // window position, then the configured default (mainly hit by pinned apps
-// that aren't running and weren't listed in leftApps/rightApps).
+// that aren't running and weren't listed in leftApps/rightApps). Skips the
+// accessible-name lookup (an AutomationProperties::GetName call plus a
+// lowercasing string copy) entirely when there's nothing to match it
+// against - leftApps/rightApps are both empty by default, and this runs
+// for every task-list button on every single ArrangeOverride pass.
 ButtonClassification ClassifyTaskListButton(FrameworkElement element) {
-    std::wstring name = GetButtonAccessibleName(element);
-
-    if (ContainsAnyFragment(name, g_settings.leftApps)) {
-        return {Side::Left, PinnedAppOrderKey()};
-    }
-    if (ContainsAnyFragment(name, g_settings.rightApps)) {
-        return {Side::Right, PinnedAppOrderKey()};
+    if (!g_settings.leftApps.empty() || !g_settings.rightApps.empty()) {
+        std::wstring name = GetButtonAccessibleName(element);
+        if (ContainsAnyFragment(name, g_settings.leftApps)) {
+            return {Side::Left, PinnedAppOrderKey()};
+        }
+        if (ContainsAnyFragment(name, g_settings.rightApps)) {
+            return {Side::Right, PinnedAppOrderKey()};
+        }
     }
 
     HWND hwnd = GetButtonHwnd(element);
@@ -1228,11 +1233,6 @@ bool IsTaskListButton(FrameworkElement element) {
 // Layout: computing target X positions
 // ============================================================================
 
-double ComputeStartButtonX(FrameworkElement startElement) {
-    double centerX = GetMonitorCenterXLocal();
-    return centerX - startElement.ActualWidth() / 2.0;
-}
-
 int SystemButtonRank(SystemButton b) {
     switch (b) {
         case SystemButton::Search:
@@ -1261,12 +1261,31 @@ int SystemButtonRank(SystemButton b) {
 double g_lastLeftSystemClusterWidth = 0;
 double g_lastRightSystemClusterWidth = 0;
 
+// A repeater child element paired with its SystemButton classification,
+// computed once per child per RecomputeLayoutPlan pass instead of
+// re-deriving IdentifySystemButton
+// (a winrt::get_class_name call - IInspectable::GetRuntimeClassName plus
+// an HSTRING allocation) every time it's needed. Previously recomputed up
+// to 4 times per child per pass: once each in the Start-finding, cluster-
+// width, and system-button-placement loops, plus once per child *again*
+// inside ComputeSystemButtonX's own widthBefore loop for every realized
+// system button (itself also re-walking the repeater via
+// GetRepeaterChildElements instead of reusing what RecomputeLayoutPlan
+// already enumerated).
+struct ChildInfo {
+    FrameworkElement element;
+    SystemButton systemButton;
+};
+
 // Places Search/TaskView/Widgets either at the taskbar's far left edge, or
 // immediately adjacent to one side of the Start button, per
 // g_settings.systemButtonsPlacement. clusterWidth is the combined width of
 // all three, computed once by the caller (see g_lastLeftSystemClusterWidth's
 // comment for why it's no longer computed here as a side effect).
-double ComputeSystemButtonX(FrameworkElement repeater,
+// childInfos is the whole repeater's already-classified children (see
+// ChildInfo's comment) - avoids both re-walking the repeater and
+// re-deriving each child's SystemButton classification.
+double ComputeSystemButtonX(const std::vector<ChildInfo>& childInfos,
                             FrameworkElement targetElement,
                             SystemButton target,
                             double startCenterX,
@@ -1278,10 +1297,10 @@ double ComputeSystemButtonX(FrameworkElement repeater,
     }
 
     double widthBefore = 0;
-    for (auto& child : GetRepeaterChildElements(repeater)) {
-        int r = SystemButtonRank(IdentifySystemButton(child));
+    for (auto& info : childInfos) {
+        int r = SystemButtonRank(info.systemButton);
         if (r >= 0 && r < targetRank) {
-            widthBefore += FullFootprintWidth(child);
+            widthBefore += FullFootprintWidth(info.element);
         }
     }
 
@@ -1744,17 +1763,22 @@ void RecomputeLayoutPlan() {
         double startCenterX = GetMonitorCenterXLocal();
         std::unordered_map<void*, double> newPlan;
 
+        // Classify each child's SystemButton status exactly once - see
+        // ChildInfo's comment for why (was up to 4 redundant
+        // winrt::get_class_name calls per child per pass beforehand).
+        std::vector<ChildInfo> childInfos;
+        childInfos.reserve(children.size());
+        for (auto& child : children) {
+            childInfos.push_back({child, IdentifySystemButton(child)});
+        }
+
         // Start first: ComputeSystemButtonX/PlanTaskListButtons below
         // both read g_lastStartWidth, so it needs to already reflect this
-        // pass by the time they run, not the previous one. Inlined rather
-        // than calling ComputeStartButtonX (same formula) purely to reuse
-        // the startCenterX already computed once above, instead of that
-        // function re-deriving it via another GetMonitorCenterXLocal()
-        // call.
-        for (auto& child : children) {
-            if (IdentifySystemButton(child) == SystemButton::Start) {
-                g_lastStartWidth = child.ActualWidth();
-                newPlan[winrt::get_abi(child)] =
+        // pass by the time they run, not the previous one.
+        for (auto& info : childInfos) {
+            if (info.systemButton == SystemButton::Start) {
+                g_lastStartWidth = info.element.ActualWidth();
+                newPlan[winrt::get_abi(info.element)] =
                     startCenterX - g_lastStartWidth / 2.0;
                 break;
             }
@@ -1768,9 +1792,9 @@ void RecomputeLayoutPlan() {
         // g_lastLeftSystemClusterWidth's comment) - before any task list
         // button below runs for the same reason.
         double systemClusterWidth = 0;
-        for (auto& child : children) {
-            if (SystemButtonRank(IdentifySystemButton(child)) >= 0) {
-                systemClusterWidth += FullFootprintWidth(child);
+        for (auto& info : childInfos) {
+            if (SystemButtonRank(info.systemButton) >= 0) {
+                systemClusterWidth += FullFootprintWidth(info.element);
             }
         }
         bool systemButtonsAdjacent = g_settings.systemButtonsPlacement ==
@@ -1786,14 +1810,14 @@ void RecomputeLayoutPlan() {
                 ? systemClusterWidth
                 : 0;
 
-        for (auto& child : children) {
-            SystemButton sb = IdentifySystemButton(child);
-            if (sb == SystemButton::None || sb == SystemButton::Start) {
+        for (auto& info : childInfos) {
+            if (info.systemButton == SystemButton::None ||
+                info.systemButton == SystemButton::Start) {
                 continue;
             }
-            newPlan[winrt::get_abi(child)] = ComputeSystemButtonX(
-                repeater, child, sb, startCenterX, g_lastStartWidth,
-                systemClusterWidth);
+            newPlan[winrt::get_abi(info.element)] = ComputeSystemButtonX(
+                childInfos, info.element, info.systemButton, startCenterX,
+                g_lastStartWidth, systemClusterWidth);
         }
 
         // Task list buttons last - see PlanTaskListButtons' own comment
