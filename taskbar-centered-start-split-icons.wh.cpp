@@ -963,8 +963,21 @@ HWND ResolveHwndFromTaskListButton(FrameworkElement element) {
 // at a fixed rate forever. A live element that's simply slow to resolve
 // still gets the fast early retries, since the counter only advances on
 // an actual failure and resets to 0 on the first success.
+//
+// identity (the button's accessible name at the time it was last resolved)
+// guards against a different staleness case entirely: ItemsRepeater can
+// rebind an already-realized element to a *different* item (e.g. the user
+// drag-reorders two running apps' buttons) rather than destroying and
+// recreating it. Without a way to notice that, a cache entry keyed by the
+// element's ABI pointer would keep reporting the OLD item's HWND for the
+// element's new identity indefinitely - the "hwnd is still a valid window"
+// check alone can't catch this, since the old HWND is still alive, just no
+// longer what this element represents. ResolvePendingButtonHwnds compares
+// the live accessible name against this on every check and forces a
+// re-resolve on a mismatch.
 struct ButtonHwndCacheEntry {
     HWND hwnd = nullptr;
+    std::wstring identity;
     ULONGLONG lastAttempt = 0;
     int consecutiveFailures = 0;
 };
@@ -994,7 +1007,8 @@ std::unordered_map<void*, ButtonHwndCacheEntry> g_buttonHwndCache;
 // (a standalone event, not nested inside a live layout pass), matching
 // where the pointer-release-based technique it's adapted from actually
 // runs in the mods it's borrowed from.
-bool ResolveAndCacheButtonHwnd(FrameworkElement element) {
+bool ResolveAndCacheButtonHwnd(FrameworkElement element,
+                               const std::wstring& identity) {
     void* key = winrt::get_abi(element);
     HWND previous = nullptr;
     int failures = 0;
@@ -1006,7 +1020,7 @@ bool ResolveAndCacheButtonHwnd(FrameworkElement element) {
 
     HWND hwnd = ResolveHwndFromTaskListButton(element);
     failures = hwnd ? 0 : failures + 1;
-    g_buttonHwndCache[key] = {hwnd, GetTickCount64(), failures};
+    g_buttonHwndCache[key] = {hwnd, identity, GetTickCount64(), failures};
     return hwnd != previous;
 }
 
@@ -1234,29 +1248,30 @@ int SystemButtonRank(SystemButton b) {
 
 // Total footprint of Search+TaskView+Widgets together, used both to lay
 // them out and to reserve room for them next to Start (in adjacent mode) so
-// task list buttons on that side don't overlap them. Updated whenever any
-// of the three arranges; read by task list button placement.
+// task list buttons on that side don't overlap them. Computed once per
+// pass in RecomputeLayoutPlan (from the already-enumerated `children`) and
+// written here unconditionally on every pass - not as a side effect of
+// ComputeSystemButtonX running for a realized system button, which was the
+// previous approach and had a real bug: if none of the three are currently
+// realized in the repeater (all hidden, or a session that starts with them
+// hidden), ComputeSystemButtonX never ran and these kept whatever value an
+// earlier configuration left behind, permanently reserving that much dead
+// space next to Start in "adjacent" mode. Zero when the cluster is
+// genuinely empty now, always.
 double g_lastLeftSystemClusterWidth = 0;
 double g_lastRightSystemClusterWidth = 0;
 
-double SystemButtonClusterWidth(FrameworkElement repeater) {
-    double total = 0;
-    for (auto& child : GetRepeaterChildElements(repeater)) {
-        if (SystemButtonRank(IdentifySystemButton(child)) >= 0) {
-            total += FullFootprintWidth(child);
-        }
-    }
-    return total;
-}
-
 // Places Search/TaskView/Widgets either at the taskbar's far left edge, or
 // immediately adjacent to one side of the Start button, per
-// g_settings.systemButtonsPlacement.
+// g_settings.systemButtonsPlacement. clusterWidth is the combined width of
+// all three, computed once by the caller (see g_lastLeftSystemClusterWidth's
+// comment for why it's no longer computed here as a side effect).
 double ComputeSystemButtonX(FrameworkElement repeater,
                             FrameworkElement targetElement,
                             SystemButton target,
                             double startCenterX,
-                            double startWidth) {
+                            double startWidth,
+                            double clusterWidth) {
     int targetRank = SystemButtonRank(target);
     if (targetRank < 0) {
         return 0;
@@ -1271,25 +1286,18 @@ double ComputeSystemButtonX(FrameworkElement repeater,
     }
 
     if (g_settings.systemButtonsPlacement == SystemButtonsPlacement::FarLeft) {
-        g_lastLeftSystemClusterWidth = 0;
-        g_lastRightSystemClusterWidth = 0;
         return 8 + widthBefore;  // small left margin
     }
 
-    double clusterWidth = SystemButtonClusterWidth(repeater);
     double gap = g_settings.gapPx;
     double ownWidth = FullFootprintWidth(targetElement);
 
     if (g_settings.systemButtonsAdjacentSide == Side::Left) {
-        g_lastLeftSystemClusterWidth = clusterWidth;
-        g_lastRightSystemClusterWidth = 0;
         // Stack right-to-left outward from Start: lowest rank closest.
         double widthAfter = clusterWidth - widthBefore - ownWidth;
         return startCenterX - startWidth / 2.0 - gap - widthAfter - ownWidth;
     }
 
-    g_lastLeftSystemClusterWidth = 0;
-    g_lastRightSystemClusterWidth = clusterWidth;
     return startCenterX + startWidth / 2.0 + gap + widthBefore;
 }
 
@@ -1362,10 +1370,15 @@ void PlanTaskListButtons(const std::vector<FrameworkElement>& children,
     double startWidth = g_lastStartWidth;
     bool adjacent =
         g_settings.systemButtonsPlacement == SystemButtonsPlacement::AdjacentStart;
-    double leftExtra = (adjacent && g_settings.systemButtonsAdjacentSide == Side::Left)
+    // Only add the gap when the cluster actually has width - otherwise an
+    // empty cluster (all three hidden) still reserved a bare gapPx of dead
+    // space next to Start for no reason.
+    double leftExtra = (adjacent && g_settings.systemButtonsAdjacentSide == Side::Left &&
+                        g_lastLeftSystemClusterWidth > 0)
                             ? (g_lastLeftSystemClusterWidth + gap)
                             : 0;
-    double rightExtra = (adjacent && g_settings.systemButtonsAdjacentSide == Side::Right)
+    double rightExtra = (adjacent && g_settings.systemButtonsAdjacentSide == Side::Right &&
+                         g_lastRightSystemClusterWidth > 0)
                              ? (g_lastRightSystemClusterWidth + gap)
                              : 0;
 
@@ -1526,11 +1539,19 @@ void ResolvePendingButtonHwnds() {
         void* key = winrt::get_abi(child);
         liveTaskListButtons.insert(key);
 
+        std::wstring identity = GetButtonAccessibleName(child);
+
         auto it = g_buttonHwndCache.find(key);
         bool needsResolve = it == g_buttonHwndCache.end();
         if (!needsResolve) {
             if (it->second.hwnd) {
-                needsResolve = !IsWindow(it->second.hwnd);
+                // Identity mismatch means ItemsRepeater rebound this
+                // element to a different item since we last resolved it -
+                // see ButtonHwndCacheEntry's comment. The old HWND is
+                // still a perfectly valid window, just no longer this
+                // element's, so IsWindow() alone can't catch this case.
+                needsResolve = !IsWindow(it->second.hwnd) ||
+                               identity != it->second.identity;
             } else {
                 int shift = std::min(it->second.consecutiveFailures, 4);
                 ULONGLONG backoffMs = 2000ULL << shift;  // 2s..32s
@@ -1538,7 +1559,7 @@ void ResolvePendingButtonHwnds() {
             }
         }
 
-        if (needsResolve && ResolveAndCacheButtonHwnd(child)) {
+        if (needsResolve && ResolveAndCacheButtonHwnd(child, identity)) {
             anyChanged = true;
         }
     }
@@ -1740,16 +1761,39 @@ void RecomputeLayoutPlan() {
         }
 
         // Search/TaskView/Widgets next: PlanTaskListButtons reads
-        // g_lastLeftSystemClusterWidth/g_lastRightSystemClusterWidth
-        // (updated inside ComputeSystemButtonX), so these need to run
-        // before any task list button below for the same reason.
+        // g_lastLeftSystemClusterWidth/g_lastRightSystemClusterWidth, so
+        // these need to be set - unconditionally, every pass, so a
+        // cluster that's empty this pass reads as genuinely 0 rather than
+        // keeping a stale value from an earlier one (see
+        // g_lastLeftSystemClusterWidth's comment) - before any task list
+        // button below runs for the same reason.
+        double systemClusterWidth = 0;
+        for (auto& child : children) {
+            if (SystemButtonRank(IdentifySystemButton(child)) >= 0) {
+                systemClusterWidth += FullFootprintWidth(child);
+            }
+        }
+        bool systemButtonsAdjacent = g_settings.systemButtonsPlacement ==
+                                     SystemButtonsPlacement::AdjacentStart;
+        g_lastLeftSystemClusterWidth =
+            (systemButtonsAdjacent &&
+             g_settings.systemButtonsAdjacentSide == Side::Left)
+                ? systemClusterWidth
+                : 0;
+        g_lastRightSystemClusterWidth =
+            (systemButtonsAdjacent &&
+             g_settings.systemButtonsAdjacentSide == Side::Right)
+                ? systemClusterWidth
+                : 0;
+
         for (auto& child : children) {
             SystemButton sb = IdentifySystemButton(child);
             if (sb == SystemButton::None || sb == SystemButton::Start) {
                 continue;
             }
             newPlan[winrt::get_abi(child)] = ComputeSystemButtonX(
-                repeater, child, sb, startCenterX, g_lastStartWidth);
+                repeater, child, sb, startCenterX, g_lastStartWidth,
+                systemClusterWidth);
         }
 
         // Task list buttons last - see PlanTaskListButtons' own comment
