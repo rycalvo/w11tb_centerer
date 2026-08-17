@@ -33,12 +33,42 @@ right next to Start on whichever side you prefer.
 ## Known limitations (please read before reporting issues)
 
 - **Windows 11 only.** Windows 10's taskbar has no XAML layer to hook into.
-- **Primary monitor only.** Screen-center math and window-side classification
-  use the primary monitor. Taskbars on secondary displays are not specially
-  handled by this mod (their icons keep the default layout Windows gives
-  them) - the mod's positioning plan is only ever computed on the primary
-  taskbar's own thread, so secondary-monitor elements are simply never
-  included in it and fall through to Windows' native positioning.
+- **Primary monitor only**, for both the Start button's position and
+  window-side classification - and on a multi-monitor setup this is a
+  bigger limitation than it might sound: a window's side is decided by
+  comparing its position against the *primary* monitor's center line, so
+  every window on a monitor entirely to one side of the primary reads as a
+  fixed left/right regardless of where on that monitor it actually sits -
+  only movement within the primary monitor (or across its center line) is
+  tracked per-pixel. Taskbars on secondary displays aren't specially
+  handled either (their icons keep Windows' default layout) - the mod's
+  positioning plan is only ever computed on the primary taskbar's own
+  thread, so secondary-monitor elements are simply never included in it
+  and fall through to Windows' native positioning.
+- **Don't enable alongside "Start button always on the left".** Both mods
+  hook the same process-wide `IUIElement::Arrange` vtable slot to force
+  the Start button's own X position; with both enabled, whichever one
+  installed its hook second wins, and the result is undefined. This mod's
+  `systemButtonsPlacement: far-left` setting covers the same "keep
+  everything else out of Start's way" goal that mod's
+  `otherSystemButtonsOnTheLeft` option does, so there's no reason to run
+  both together.
+- **A very crowded side compresses instead of overflowing cleanly.** If
+  enough app icons pile up on one side that they'd run into the system
+  tray/clock on the right (or, in "far left" placement, into Search/Task
+  View/Widgets on the left), icon spacing on that side is compressed just
+  enough to keep the whole group within bounds - icons still render at
+  full size, so once genuinely crowded they visually overlap each other
+  rather than being hidden or scrolled the way the taskbar's own overflow
+  handling would.
+- **Windows' own "Combine taskbar buttons and hide labels: When taskbar
+  is full" doesn't shrink icons under this mod** (icons stay full-size and
+  compress/overlap instead, per the point above) - "Always" isn't
+  affected and works normally. Likely because the "when full" decision is
+  made by native layout logic (this mod only overrides each button's
+  final X position afterward, it never touches sizing), evaluated against
+  the taskbar's native, unsplit layout rather than this mod's split one -
+  unconfirmed, not yet investigated further.
 - **Undocumented internals.** This mod hooks private, unversioned classes
   inside `taskbar.dll` and `Taskbar.View.dll` (via symbols resolved from
   Microsoft's public symbol server at runtime, not hardcoded offsets). A
