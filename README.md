@@ -46,13 +46,13 @@ right next to Start on whichever side you prefer.
   thread, so secondary-monitor elements are simply never included in it
   and fall through to Windows' native positioning.
 - **Don't enable alongside "Start button always on the left".** Both mods
-  hook the same process-wide `IUIElement::Arrange` vtable slot to force
-  the Start button's own X position; with both enabled, whichever one
-  installed its hook second wins, and the result is undefined. This mod's
-  `systemButtonsPlacement: far-left` setting covers the same "keep
-  everything else out of Start's way" goal that mod's
-  `otherSystemButtonsOnTheLeft` option does, so there's no reason to run
-  both together.
+  hook the same process-wide `IUIElement::Arrange` vtable slot, and both
+  write their own X position for the Start button - with both enabled,
+  they simply disagree, and whichever one's hook runs last for a given
+  Arrange call wins for that pass. This mod's `systemButtonsPlacement:
+  far-left` setting covers the same "keep everything else out of Start's
+  way" goal that mod's `otherSystemButtonsOnTheLeft` option does, so
+  there's no reason to run both together.
 - **A very crowded side compresses instead of overflowing cleanly.** If
   enough app icons pile up on one side that they'd run into the system
   tray/clock on the right (or, in "far left" placement, into Search/Task
