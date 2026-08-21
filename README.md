@@ -68,7 +68,13 @@ right next to Start on whichever side you prefer.
   made by native layout logic (this mod only overrides each button's
   final X position afterward, it never touches sizing), evaluated against
   the taskbar's native, unsplit layout rather than this mod's split one -
-  unconfirmed, not yet investigated further.
+  unconfirmed, not yet investigated further. **Separately reported:** with
+  "Always" enabled, multiple windows of the same app have been observed
+  not combining into one button at all, appearing as separate icons
+  regardless of count. This mod has no code path that could cause that -
+  grouping is a native decision made before this mod's hooks ever see a
+  button - but it's flagged here as a planned follow-up pending
+  confirmation of whether it reproduces with the mod disabled.
 - **Undocumented internals.** This mod hooks private, unversioned classes
   inside `taskbar.dll` and `Taskbar.View.dll` (via symbols resolved from
   Microsoft's public symbol server at runtime, not hardcoded offsets). A
