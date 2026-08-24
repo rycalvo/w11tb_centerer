@@ -75,6 +75,14 @@ right next to Start on whichever side you prefer.
   grouping is a native decision made before this mod's hooks ever see a
   button - but it's flagged here as a planned follow-up pending
   confirmation of whether it reproduces with the mod disabled.
+- **A grouped button (multiple windows combined under one icon) follows
+  only its first window.** With "Combine taskbar buttons" set to "Always",
+  a group's side and ordering are both decided by whichever of its windows
+  happens to be first in the taskbar's own internal list - not necessarily
+  the one you'd expect - so a group whose windows straddle the center line
+  won't visually reflect all of them. There's no exposed way to pick a
+  more meaningful "primary" window for a group, so this is a documented
+  tradeoff rather than a bug.
 - **Undocumented internals.** This mod hooks private, unversioned classes
   inside `taskbar.dll` and `Taskbar.View.dll` (via symbols resolved from
   Microsoft's public symbol server at runtime, not hardcoded offsets). A
