@@ -1281,3 +1281,81 @@ Given both the unverified visual outcome and that history, this wasn't
 implemented blind - it needs a live crowded-taskbar test loop with the
 user before landing, not a speculative change to the file's most fragile
 code path.
+
+## Two `kMaxResolveFailures` bugs found by round 26, both from the same
+root cause: the cap didn't distinguish *why* a resolve attempt failed
+
+`kMaxResolveFailures` (added the round it was introduced) was meant to
+bound one specific risk: a button whose click-sentinel interception is
+broken dispatching real `ReportClicked` calls forever. But
+`ResolveAndCacheButtonHwnd` treated every `nullptr` return from
+`ResolveHwndFromTaskListButton` as equally close to that risk, when most
+`nullptr` returns never got near dispatching a click at all -
+`!g_realTaskbarClickObserved`, a null view model, `ITaskGroup::IsRunning
+== false` (the ordinary pinned-but-not-running case, i.e. almost every
+real taskbar) are all bail-outs *before* `ReportClicked`. Counting them
+toward the same cap as a genuine dispatched-and-missed click created two
+distinct bugs:
+
+**Bug 1: the terminal cap silently killed resolution for the rest of the
+session, well before any real click-safety concern.** A pinned-but-not-
+running app's group bails at the `IsRunning` check on *every* attempt, so
+its `consecutiveFailures` climbed the normal 2s/4s/8s/.../256s backoff
+schedule and hit 8 (`kMaxResolveFailures`) after summing to ~510s (~8.5
+min) - at which point `ResolvePendingButtonHwnds`' `backoffElapsed` check
+permanently refused to retry it, with no dispatched click ever having
+happened. Worse, `g_realTaskbarClickObserved`'s own gate (added the same
+round as the cap) meant *every* entry bailed out this way during the
+window before the user's first taskbar click, so a session with no click
+in the first ~8.5 minutes reached this terminal state for every button at
+once - position-based splitting and drag-follow silently died for the
+rest of the session, with every icon stuck on `unresolvedAppsDefaultSide`,
+directly contradicting the "until you click any taskbar button once"
+tradeoff the gate's own README bullet promises.
+
+**Bug 2: `NextResolveDelayMs` didn't know about the cap at all, so a
+terminal entry pinned the resolve timer at ~100 Hz forever.**
+`ResolvePendingButtonHwnds` stops updating `lastAttempt` once an entry is
+terminal (it's never retried), but `NextResolveDelayMs` kept computing
+`dueAt = lastAttempt + ResolveBackoffMs(consecutiveFailures)` for every
+`hwnd == nullptr` entry regardless, with no equivalent terminal check.
+Once that fixed, no-longer-advancing `dueAt` fell into the past, `now -
+dueAt` stayed positive forever, so `pendingDelay` stayed at `0` on every
+subsequent call - `ScheduleNextResolveTick` then re-armed
+`SetTimer(nullptr, 0, 0, ...)` every tick, which USER32 clamps to its
+10ms floor (`USER_TIMER_MINIMUM`), producing a permanent ~100Hz loop: a
+full `GetRepeaterChildElements` walk plus a `winrt::get_class_name`/
+`GetButtonAccessibleName` UIA fetch per button, on the shell's own UI
+thread, accomplishing nothing, for the rest of the session. This bug
+existed independently of bug 1 - fixing only bug 1 (so the cap rarely
+triggers) wouldn't have made `NextResolveDelayMs` correct if a terminal
+entry ever *did* occur through the intended path (a genuinely broken
+interception).
+
+**The fix closes both from the same root cause.** `ResolveHwndFromIndividualTaskItem`/
+`ResolveHwndFromTaskGroup` now take an `outClickDispatched` out-parameter,
+set `true` only immediately before the `TaskItem_ReportClicked_Original`/
+`TaskGroup_ReportClicked_Original` call each makes - every earlier
+`return nullptr` in either function leaves it `false`. `ResolveHwndFromTaskListButton`
+threads this through (also fixing a related latent double-dispatch: if the
+item path dispatches and misses, `itemDispatched` is `true` even though
+`hwnd` is `nullptr`, so the group path is no longer tried afterward for
+the same button - previously a missed item-path click would silently fall
+through and dispatch a second, redundant group-path click too).
+`ResolveAndCacheButtonHwnd` now only increments `consecutiveFailures` when
+`clickDispatched` is `true`; a bail-out leaves it unchanged (`lastAttempt`
+still advances either way, so a persistently-bailing-out entry - like a
+pinned-not-running app for its entire session - keeps retrying forever at
+`ResolveBackoffMs(0)`'s flat 2s cadence, cheap and indefinite, rather than
+escalating toward a cap that was never meant to apply to it). Separately,
+`NextResolveDelayMs` now treats `consecutiveFailures >= kMaxResolveFailures`
+exactly like an already-resolved entry (`anyIdleWorthy`, not `anyPending`)
+- both conditions mean "`ResolvePendingButtonHwnds` will never move this
+entry's `dueAt` again," so both need the same `kIdleResolveTickMs`
+treatment rather than a `dueAt` that can fall further into the past
+forever. With the click-dispatch fix in place the terminal state should
+now be rare in practice (it requires several genuine capture-misses on
+one specific button, and the pre-existing session-wide
+`kClickSentinelMissesBeforeBroken` latch already trips the whole path
+broken after just 3), but `NextResolveDelayMs` has to be correct
+regardless of how rarely the state it's guarding against actually occurs.
