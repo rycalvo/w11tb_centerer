@@ -1073,3 +1073,211 @@ regardless of the subclass. See "Why the subclass comes off Shell_TrayWnd
 as early as it's safe to" above for the one further consequence of this
 removal (the disable-time snap-back becoming cosmetically delayed instead
 of immediate).
+
+## `ComputeSystemButtonX`'s taskbar-order rewrite
+
+Previously used a hardcoded `SystemButtonRank` table (Search=0, TaskView=1,
+Widgets=2) to decide each system button's ordering relative to the others.
+This silently assumed at most one instance of each `SystemButton` enum
+value could ever exist - if a future Windows build ever surfaced two
+`Taskbar.TaskbarExtensionElement`s (both classified as `SystemButton::Search`
+by `IdentifySystemButton`), both would get rank 0, both would compute the
+same X, and they'd render on top of each other. Rewritten to walk
+`childInfos` (already in taskbar order) directly, summing the footprint of
+every other system button that appears earlier than the target element,
+stopping at the target's own identity (`info.element == targetElement`) -
+this tracks whatever order the taskbar actually presents these buttons in,
+rather than a fixed table, and degrades gracefully (each button just gets
+its own real position, no forced collision) if the one-of-each assumption
+ever breaks. Behaviorally identical to the old table-based version for the
+normal case (exactly one Search, one TaskView, one Widgets, in that native
+order).
+
+## `trackWindowPositions` setting
+
+Added so a user can keep the headline feature (Start pinned to true center,
+icons split into two groups by `leftApps`/`rightApps`/
+`unresolvedAppsDefaultSide`) without the click-sentinel probing or the two
+system-wide `SetWinEventHook` registrations at all - see the reviewer
+discussion that prompted this in the PR history for the full tradeoff
+analysis.
+
+Implemented as narrowly as possible: `EnsureTaskbarWnd` simply doesn't call
+`StartWinEventHook()` when the setting is off. Nothing else needed to
+change - `g_buttonHwndCache` then never gets populated (nothing ever calls
+`ResolveAndCacheButtonHwnd`, since that only ever runs from the resolve
+timer this thread would have owned), so `GetButtonHwnd` always returns
+`nullptr`, and `ClassifyTaskListButton`'s existing "unresolved" fallback
+path (leftApps/rightApps, then `ResolveUnresolvedAppsDefaultSide()`) already
+does exactly what's wanted for every running app, with zero changes to that
+function. The click-sentinel hooks (`CTaskListWnd_HandleClick_Hook`,
+`ITaskGroup_IsRunning_Hook`) stay installed either way - they only ever
+intercept a sentinel-marked call, and with nothing ever dispatching one,
+they're inert.
+
+One real interaction worth calling out in the settings description:
+`taskListOrder: distance-from-center` mode's ranking degenerates when this
+is off, since every button now gets the same +/-infinity `orderKey` from
+`PinnedAppOrderKey()` (there being no live window position left to measure
+a real distance from) - the only remaining ordering signal within a side is
+`pinnedAppsAnchor`, plus the taskbar-index tiebreak. Not a bug, just a
+mode combination worth knowing about.
+
+**Why toggling it live needed `StopWinEventHookForToggle`, a separate
+function from `StopWinEventHook`, rather than just calling the existing
+one**: `StartWinEventHook`/`StopWinEventHook`'s serialization already has a
+documented, deliberately one-way latch - `g_winEventThreadStopped`, set
+permanently `true` by `StopWinEventHook` specifically so a
+`StartWinEventHook` call arriving after mod teardown begins can't recreate
+a thread nobody would tear down (see the "race `g_winEventThreadMutex`
+prevents" entry above). The first implementation of this setting reused
+`StopWinEventHook` directly from a live settings change, which would have
+tripped that same latch permanently - flipping the setting back on later
+would then silently do nothing until the mod was reloaded, since
+`StartWinEventHook` checks that exact latch and refuses to start. Caught
+during the user's own testing (toggling the setting live and seeing no
+effect either direction) before it shipped.
+
+Fixed by splitting the shared thread-teardown body into
+`StopWinEventHookInternal(bool permanent)`, with `StopWinEventHook()`
+(mod-teardown path, called from `Wh_ModUninit`) always passing `true` and a
+new `StopWinEventHookForToggle()` (live-settings path) passing `false`. The
+critical invariant - `g_winEventThreadStopped` only ever transitions
+permanently, and always does so on every real teardown regardless of
+whether a concurrent toggle-stop already tore the thread down first - holds
+because `StopWinEventHookInternal` sets it unconditionally when
+`permanent` is true, *inside* the mutex-guarded section, before checking
+whether a thread was actually found. So a `StopWinEventHookForToggle` call
+racing an actual `Wh_ModUninit` teardown can't leave the latch unset: either
+it runs first and clears `g_winEventThread` (the teardown's own
+`StopWinEventHookInternal(true)` then still sets the latch, just finds
+`thread == nullptr` and returns immediately), or the teardown runs first
+and sets the latch itself before the toggle's call gets the lock. Either
+interleaving ends with the latch set and the thread properly joined exactly
+once.
+
+The actual start/stop-on-change trigger lives in `TaskbarWndSubclassProc`'s
+`SettingsChangedMsg` case, not in `ApplyLoadedSettings` - that's the one
+point where `g_settings` actually changes value for every settings-update
+path, including the deferred one through `g_pendingSettings`/
+`ApplyPendingSettingsIfAny` (which itself re-enters `ApplyLoadedSettings`,
+which - once the taskbar and subclass are both ready - always ends up back
+at this same `PostMessage(SettingsChangedMsg())`/dispatch path). Comparing
+old vs. new `trackWindowPositions` right there, on the taskbar thread,
+before deciding to call `StartWinEventHook()`/`StopWinEventHookForToggle()`,
+means every settings-change path is covered by one check with no risk of
+missing one. `EnsureTaskbarWnd`'s own one-shot `StartWinEventHook()` call
+remains for the genuine initial-startup case (and the rare taskbar-recreate
+case) - by the time any settings change could reach the
+`SettingsChangedMsg` dispatch path, the mod is already fully up and
+running, so the two mechanisms never need to agree on anything beyond "is
+the thread currently running," which the shared `g_winEventThread`/
+`g_winEventThreadId`/mutex state already answers consistently either way.
+
+**Confirmed working by the user's own live testing**: toggling the setting
+off froze `winEvents: raw=` for the rest of that session (thread genuinely
+stopped) and toggling it back on produced a brand-new
+`WinEventHookThreadProc` log line with a different thread id (fresh
+`CreateThread`, not a leftover). One gap the same test surfaced:
+`g_buttonHwndCache` isn't cleared on toggle-off, so an already-resolved
+button kept reporting a nonzero `hwndResolved` and used its last-known
+(now frozen) window position instead of immediately falling back to
+`leftApps`/`rightApps`/`unresolvedAppsDefaultSide`, contradicting the
+setting's own description. Fixed by clearing `g_buttonHwndCache` in the
+same `SettingsChangedMsg` branch that calls `StopWinEventHookForToggle()` -
+safe to do directly there since every other access to that cache already
+runs on this same taskbar thread (via `ResolvePendingButtonHwnds`,
+dispatched through the identical `TaskbarWndSubclassProc` mechanism).
+
+## `g_realTaskbarClickObserved` (first-probe safety gate)
+
+The unattended click-sentinel probe (see the HWND-resolution section
+above) is only as safe as `CTaskListWnd_HandleClick_Hook`'s interception
+actually being reachable. Everything else in that system (the miss-counter
+latch, the per-entry backoff ceiling) detects a broken interception only
+*after* it's already dispatched at least one probe that may have become a
+real click. This doesn't close that gap - a `ReportClicked` implementation
+that touches its `LauncherOptions const&` argument before ever reaching
+`CTaskListWnd::HandleClick` would still crash on the very first probe, with
+no miss ever recorded - but it does close a narrower, cheaper-to-close one:
+proving the hook chain is *installed and actually being exercised* at all,
+before the very first unattended probe of the session ever runs.
+
+`CTaskListWnd_HandleClick_Hook` already sees every genuine (non-sentinel)
+click that reaches it, via its existing pass-through branch to
+`CTaskListWnd_HandleClick_Original`. Setting `g_realTaskbarClickObserved`
+there the first time that branch runs, and having both
+`ResolveHwndFromIndividualTaskItem`/`ResolveHwndFromTaskGroup` bail out
+before ever dispatching their own sentinel click until that flag is true,
+means the interception point has to have already handled one real click
+successfully before this mod's own background timer is allowed to risk
+one of its own. The practical cost is small and one-time: until the user
+clicks any taskbar button once per session, running apps classify the same
+way pinned-but-not-running ones always do (via
+`leftApps`/`rightApps`/`unresolvedAppsDefaultSide`) - in practice a
+near-imperceptible delay, since most sessions see a real taskbar click
+within seconds. A single shared flag (not per-path) is enough: the item
+and group paths share the same `CTaskListWnd::HandleClick` entry point, so
+proving it's reachable at all covers both.
+
+## Diagnostics logging trim (per-symbol resolved/MISSING lines)
+
+`HookTaskbarDllSymbols`/`HookTaskbarViewDllSymbols` used to log every
+optional symbol's resolved/MISSING status unconditionally, every single
+mod load - 3 and 6 lines respectively, on top of the aggregate OK/FAILED
+line. That's pure noise once a build is known-good, but the per-symbol
+detail has real, repeatedly-used value the one time it isn't: pinpointing
+exactly which symbol a future Windows build renamed, without needing a
+second round-trip with the user to ask "which one is missing." Collapsed
+to a single conditional line per function, built from the same booleans,
+that only prints (and only lists the missing ones) when the aggregate `ok`
+is false - the common case (everything resolves) now logs nothing extra at
+all, and the failure case still names every missing symbol, just on one
+line instead of several.
+
+Deliberately **not** applied to the periodic `Arrange pass: ...` stats
+line (`ArrangePassStats`, `LayoutPlanStats`, `g_resolveStats`, the four
+standalone WinEvent counters) the way a reviewer once suggested trimming
+to just the `taskList=N (hwndResolved=M left=.. right=..)` portion. That
+richer line is the primary tool that actually diagnosed this project's own
+crash history (`skippedReentrant`, `qiFail`/`exceptions`,
+`invalidateExceptions`, and `winEvents: raw=` were each individually
+load-bearing in separate past incidents - see project history/commit log
+for specifics) - while the mod is still under active iteration with the
+same debugging workflow, the ongoing diagnostic value outweighs the
+code-surface argument for cutting it. Worth revisiting once the mod is
+genuinely stable and that workflow winds down.
+
+## Two round-25 suggestions deliberately left as-is
+
+**Folding `RATIONALE.md`'s content back into inline comments.** A
+reviewer suggested this would make the file self-contained for a future
+maintainer who never sees the external repo. The specific spots where a
+"see RATIONALE.md" pointer had actually replaced a load-bearing constraint
+(rather than just deferring extra history/color) were identified and fixed
+directly in round 24 - the reviewer named three, all restored with a
+one-sentence conclusion plus the pointer. Folding the remaining ~30
+pointers back in would undo the comment-trimming pass itself, which was a
+separate, explicit, deliberate request from the mod's author two rounds
+earlier. Not attempted, since it reverses a decision made independently of
+this specific review round.
+
+**Dropping overflow task-list buttons to native position instead of
+letting a crowded side's icons overlap.** Raised by a reviewer as an
+"if it bothers you in practice" idea, not a firm recommendation, and the
+reviewer's own phrasing already flags the tradeoff: this mod overrides X
+position only, never sizing, so there's no clean handoff to the taskbar's
+real overflow handling. What "native positioning" actually renders as for
+a button permanently excluded from `outPlan` (as opposed to the existing
+one-frame case for a just-realized zero-width button, which is
+imperceptible) is genuinely unverified - the native `ItemsRepeater` panel
+has no notion of this mod's split-layout model, so an excluded button's
+native position could as easily land somewhere more confusing than the
+compressed-overlap it would be replacing. `PlanTaskListButtons` is also
+this file's single most crash-history-laden function (see the crash
+narrative in project history for the multiple incidents that were only
+resolved by rewriting how this file relates to XAML layout entirely).
+Given both the unverified visual outcome and that history, this wasn't
+implemented blind - it needs a live crowded-taskbar test loop with the
+user before landing, not a speculative change to the file's most fragile
+code path.

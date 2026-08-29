@@ -30,6 +30,12 @@ after a drag/move settles, not on every intermediate pixel of the drag.
 Search, Task View and Widgets can either stay at the far left edge, or move
 right next to Start on whichever side you prefer.
 
+The window-tracking behind position-based splitting and drag-follow can be
+turned off entirely with `trackWindowPositions`, if you'd rather keep just
+the centered Start button and system-button placement with no background
+probing of taskbar buttons and no system-wide event hooks - every app is
+then classified the same way as a pinned-but-not-running one instead.
+
 ## Known limitations (please read before reporting issues)
 
 - **Windows 11 only.** Windows 10's taskbar has no XAML layer to hook into.
@@ -68,13 +74,7 @@ right next to Start on whichever side you prefer.
   made by native layout logic (this mod only overrides each button's
   final X position afterward, it never touches sizing), evaluated against
   the taskbar's native, unsplit layout rather than this mod's split one -
-  unconfirmed, not yet investigated further. **Separately reported:** with
-  "Always" enabled, multiple windows of the same app have been observed
-  not combining into one button at all, appearing as separate icons
-  regardless of count. This mod has no code path that could cause that -
-  grouping is a native decision made before this mod's hooks ever see a
-  button - but it's flagged here as a planned follow-up pending
-  confirmation of whether it reproduces with the mod disabled.
+  unconfirmed, not yet investigated further.
 - **A grouped button (multiple windows combined under one icon) follows
   only its first window.** With "Combine taskbar buttons" set to "Always",
   a group's side and ordering are both decided by whichever of its windows
@@ -83,6 +83,10 @@ right next to Start on whichever side you prefer.
   won't visually reflect all of them. There's no exposed way to pick a
   more meaningful "primary" window for a group, so this is a documented
   tradeoff rather than a bug.
+- **The taskbar's own overflow button, when it appears on a crowded
+  taskbar, keeps its native position** rather than being classified and
+  placed like the buttons around it - this mod doesn't give it a slot in
+  the split layout.
 - **Undocumented internals.** This mod hooks private, unversioned classes
   inside `taskbar.dll` and `Taskbar.View.dll` (via symbols resolved from
   Microsoft's public symbol server at runtime, not hardcoded offsets). A
@@ -99,7 +103,12 @@ right next to Start on whichever side you prefer.
   confirmed cause of an explorer.exe crash (specifically when Windows'
   "show taskbar apps on" setting is anything other than "All taskbars",
   since that's when a window moving across monitors structurally adds/
-  removes taskbar buttons rather than just repositioning them).
+  removes taskbar buttons rather than just repositioning them). As a
+  further safeguard, the very first such probe of a session is held back
+  until a real (non-sentinel) click has been seen passing through the same
+  interception point - so a running app's icon may briefly show on its
+  default side, rather than by window position, until you click any
+  taskbar button once.
 - **Taskbar buttons can disappear when a display is deactivated** (via
   Settings, unplugging, or a third-party display on/off tool) - if
   "Taskbar behaviors > When using multiple displays, show my taskbar apps
