@@ -77,13 +77,15 @@ itself an invalidate, so the next `WinEventProc` event needs to see it as
 "now," not still throttle against whatever raw event last landed outside
 the 150ms window before the trailing timer took over.
 
-**`g_lastShowEventArm`**: leading-edge throttle mirroring the
-LOCATIONCHANGE throttle. A top-level window becoming visible fires
-`EVENT_OBJECT_SHOW` just as often system-wide as a move fires
-LOCATIONCHANGE, and a single `arm(0)` call is enough to catch every button
-currently pending regardless of how many SHOW events land in the same
-burst. Unlike drag-follow, there's no "final position" that specifically
-needs the trailing event, so no trailing timer is needed for SHOW.
+**`g_lastUpdateVisualStatesArm`**: leading-edge throttle for
+`TaskListButton::UpdateVisualStates`' hook (round 29; see "Removing
+`EVENT_OBJECT_SHOW`" below) - same idea as `g_lastDragFollowInvalidate`'s
+LOCATIONCHANGE throttle, but touched from the taskbar/XAML UI thread this
+hook runs on instead of the dedicated WinEventHook thread. A single
+`arm(0)` call is enough to catch every button currently pending regardless
+of how many `UpdateVisualStates` calls land in the same burst. There's no
+"final position" that specifically needs a trailing event the way
+drag-follow does, so no trailing timer is needed here either.
 
 ## XamlRoot resolution (`XamlRootFromTaskbarHostSharedPtr`)
 
@@ -172,27 +174,42 @@ mechanism now known to dispatch real clicks.
 A single unconfirmed miss is NOT proof the interception is broken — a probe
 can also fail to reach `HandleClick` because the window closed between
 resolving the task item and dispatching the click, `ReportClicked` failed
-internally, or the item was mid-teardown during a taskbar rebuild. Latching
-a whole path dead on the first miss of a session risked exactly that: an
-early unlucky miss on the item path (the common path, used by every
-ungrouped button) would silently degrade every button on the taskbar to
-`unresolvedAppsDefaultSide` for the rest of the session, with only a log
-line as the symptom. `kClickSentinelMissesBeforeBroken` requires a few
-misses (still a bounded cost if the mechanism really is broken) before
-actually latching.
+internally, or the item was mid-teardown during a taskbar rebuild. An
+earlier version of this mod tolerated `kClickSentinelMissesBeforeBroken = 3`
+misses before latching, reasoning that a false latch (degrading every
+button on the taskbar to `unresolvedAppsDefaultSide` for the rest of the
+session over one unlucky miss) was worth avoiding at the cost of a few more
+probes.
 
-This bound only holds pre-confirmation: `NoteUnconfirmedClickSentinelMiss`
-returns immediately once a path is confirmed, by design — a
-post-confirmation miss is routinely innocent (see above), so counting it
-would risk latching a working path dead over an unrelated timing hiccup.
-So "at most `kClickSentinelMissesBeforeBroken` real clicks per path, per
-session" is the guarantee *before* first confirmation, not a session-wide
-cap. Also note `ResolveHwndFromTaskListButton` tries the item path first
-and falls through to the group path on a miss, so one unresolvable button
-can burn a probe on BOTH paths in a single attempt — the worst case before
-both latches trip is `2 * kClickSentinelMissesBeforeBroken` (6, at the
-current constant) dispatched clicks, not
-`kClickSentinelMissesBeforeBroken`.
+Round 29's AI review argued the asymmetry actually favors the opposite
+choice, specifically for the *pre-confirmation* case: at that point there
+is zero evidence the interception works at all, so a false latch only
+costs position tracking (recoverable by reloading the mod), while a false
+negative here means dispatching more probes with no safety net at all -
+each one a real, unintercepted click if the mechanism is genuinely broken
+(a window activating or minimizing that the user didn't touch). Changed
+`kClickSentinelMissesBeforeBroken` to `1`: the first pre-confirmation miss
+on either path now latches it immediately. `g_realTaskbarClickObserved`
+(the first-probe gate — see its own section below) already does the heavy
+lifting of keeping the *pre-confirmation* window itself short and evidence-
+based, so this mostly bounds the case where interception is broken in a
+way that gate can't detect (e.g. `ReportClicked` reaches `HandleClick` fine
+in general, but this specific button's call happens to fail for an
+unrelated reason on its very first try).
+
+This latch only ever applies pre-confirmation:
+`NoteUnconfirmedClickSentinelMiss` returns immediately once a path is
+confirmed, by design — a post-confirmation miss is routinely innocent (see
+above), so latching a working path dead over an unrelated timing hiccup
+would be a worse tradeoff there than pre-confirmation. Post-confirmation
+protection instead comes from `kMaxResolveFailures` (a per-cache-entry cap
+on genuinely dispatched-and-missed clicks, not a whole-path latch — see its
+own section). Also note `ResolveHwndFromTaskListButton` tries the item path
+first and falls through to the group path on a miss, so one unresolvable
+button can still burn a probe on both paths in a single attempt before
+either has confirmed — the worst case before both latches trip is 2
+dispatched clicks total (one per path), not `kClickSentinelMissesBeforeBroken`
+per path.
 
 **`g_clickSentinelProbingGroup`**: which path's probe is in flight on this
 thread when a sentinel click might land in `CTaskListWnd_HandleClick_Hook`
@@ -476,6 +493,47 @@ can't catch that direction; the count comparison against `g_planChildCount`
 (every child kind, not just task list buttons) catches it instead, for free,
 off the same walk.
 
+**`g_lastArrangedTaskListWidth` and the label-populate overlap bug (found
+during round 29 live-testing)**: a freshly-launched app's `TaskListButton`
+can render icon-only (its label not yet measured/populated) for the very
+`ArrangeOverride` pass that first plans its position, then grow wider a
+moment later once the label populates — with neither the button count nor
+`g_planDirty` changing in between, since XAML's own internal re-measure of
+just that one button's content is invisible to both. The hash-lookup-only
+staleness check above had no way to notice: the button was already a key in
+`g_lastArrangedX`, so it read as "covered" regardless of whether the width
+used to compute that entry's X still matched reality. The practical effect
+was specific to the *left* side: a left-side button's X is computed as
+`innermostX - widthAtComputationTime`, so growing wider afterward extends
+its rendered right edge past `innermostX` — directly into Start's own
+space, rendering its label on top of Start. (A right-side button's X is
+its own left edge directly, so growing wider extends its right edge
+further away from Start instead - no overlap, just a harmless gap that the
+next real recompute closes.) The 500ms `kMaxPlanStalenessMs` backstop
+doesn't help here either, despite the name: it only forces a real recompute
+on whatever pass actually runs after that much time has elapsed, and
+nothing about a label populating is guaranteed to trigger another
+`ArrangeOverride` pass at all if XAML doesn't consider that specific change
+significant enough to invalidate the parent repeater's own arrange - the
+bug could in principle persist indefinitely, only closed in practice by
+some unrelated trigger (most visibly, any drag/move, which calls
+`InvalidateTaskbarLayout` and forces a fresh pass). Fixed by having
+`PlanTaskListButtons` also record each button's `FullFootprintWidth()` at
+plan-computation time into `g_lastArrangedTaskListWidth` (rebuilt from
+scratch alongside `g_lastArrangedX` every full recompute, so a removed
+button's stale entry doesn't linger), and having the staleness check
+compare each already-covered task list button's *current* width against
+that recorded value - a mismatch (beyond a 0.5px epsilon, for floating-
+point noise) now forces a real recompute the same way a coverage or count
+mismatch already did. The lookup is scoped for free: the map only ever
+holds task list button keys, so the comparison naturally no-ops for Start
+and Search/Task View/Widgets (which don't dynamically resize the same way,
+and weren't observed to hit this). Not a round-29 regression - the
+underlying gap in the staleness check predates it - but round 29's faster
+resolve timing plausibly made it far more likely to actually get caught by
+a positioning pass while still in its narrow, pre-label state, rather than
+being incidentally masked by a slower path settling first.
+
 **Start-width read (bare `ActualWidth()`, not `SystemButtonContentWidth`)**:
 Start is never hidden/shown the way Search/Task View/Widgets are, so it was
 never exposed to `ActualWidth()`'s collapse-margin growth problem (see
@@ -667,8 +725,10 @@ The `forceResolve` bypass: a negatively-cached element's own
 `consecutiveFailures` keeps accumulating for as long as its button exists
 (which, for a pinned-but-not-running app, is the entire session) — by the
 time it's actually launched, the backoff could be minutes away, silently
-defeating `EVENT_OBJECT_SHOW`'s whole purpose of triggering an immediate
-resolve. It's bounded to `consecutiveFailures < kMaxForcedRetryFailures` —
+defeating the fast path's whole purpose of triggering an immediate resolve
+(round 29: `TaskListButton::UpdateVisualStates`; originally
+`EVENT_OBJECT_SHOW` - see "Removing `EVENT_OBJECT_SHOW`" below). It's
+bounded to `consecutiveFailures < kMaxForcedRetryFailures` —
 see the `g_forceResolveUnresolved` entry below for why an unconditional
 force was a real bug, not just belt-and-suspenders.
 
@@ -706,30 +766,33 @@ happens whenever Windows' "show taskbar apps on" setting isn't "All
 taskbars" and a window moves across monitors.
 
 **`g_forceResolveUnresolved`, and why unconditional forcing was a real
-bug**: set by `WinEventProc`'s `EVENT_OBJECT_SHOW` branch and the
-`ArrangeOverride` hook's count-change check — both call
-`ArmButtonHwndResolveTimer(0)` to make the next resolve pass run
-immediately, but arming the timer sooner doesn't by itself bypass a
-negatively-cached entry's own backoff gate (that backoff can be
+bug**: set by `TaskListButton::UpdateVisualStates`' hook (round 29; see
+"Removing `EVENT_OBJECT_SHOW`" below — originally `WinEventProc`'s
+`EVENT_OBJECT_SHOW` branch) and the `ArrangeOverride` hook's count-change
+check — both call `ArmButtonHwndResolveTimer(0)` to make the next resolve
+pass run immediately, but arming the timer sooner doesn't by itself bypass
+a negatively-cached entry's own backoff gate (that backoff can be
 long-lived — see `ButtonHwndCacheEntry` below). Consumed once per pass in
 `ResolvePendingButtonHwnds` to force a negatively-cached entry to retry
 regardless of backoff, but only up to `kMaxForcedRetryFailures` consecutive
-failures. A group with no running windows can never yield an HWND and bails
-at `ResolveHwndFromTaskGroup`'s `IsRunning` check before ever dispatching a
-click — the original, unconditional version of this force assumed THAT is
-the only reason a negatively-cached entry keeps failing (a pinned app that
-just launched, still catching up to its own `EVENT_OBJECT_SHOW`). But a
+failures. A group with no running windows can never yield an HWND — since
+round 29, that's now caught even earlier, by `TaskListButtonIsRunning`'s
+cheap pre-check in `ResolveHwndFromTaskListButton`, before
+`ResolveHwndFromTaskGroup`'s own `IsRunning` check ever runs — the
+original, unconditional version of this force assumed THAT is the only
+reason a negatively-cached entry keeps failing (a pinned app that just
+launched, still catching up to its own running-state signal). But a
 RUNNING app's button can also fail to resolve for reasons that don't bail
 out early — `ReportClicked` failing internally, a task item mid-teardown,
 `GetTaskItemsArray` coming back empty — and for those, forcing every retry
 unconditionally meant dispatching a real `ReportClicked` on both paths on
-every forced pass, indefinitely, at up to the ~7Hz `EVENT_OBJECT_SHOW` can
+every forced pass, indefinitely, at whatever rate the fast-path hook can
 arm this at — exactly the runaway-real-clicks scenario the backoff schedule
 exists to bound. Capping the force-bypass to entries that have only failed
 a few times keeps the "pinned app just launched" fast path intact (that
-case is still failing 0 times when `EVENT_OBJECT_SHOW` first fires) while
-letting the normal backoff schedule take back over for an entry that's
-failed repeatedly, the same way it already would with no force at all.
+case is still failing 0 times when the fast path first fires) while letting
+the normal backoff schedule take back over for an entry that's failed
+repeatedly, the same way it already would with no force at all.
 
 ## `ButtonHwndCacheEntry`
 
@@ -757,6 +820,26 @@ stays valid, just no longer this element's, so an `IsWindow()` check alone
 can't detect it — `ResolvePendingButtonHwnds` compares identity on every
 check (both the resolved and negatively-cached branches) and forces a
 re-resolve on mismatch.
+
+**`notRunning` (round 29)**: set when the last resolve attempt bailed via
+`TaskListButtonIsRunning`'s cheap pre-check specifically, as opposed to any
+other bail-out reason (`!g_realTaskbarClickObserved`, a null view model,
+`ITaskGroup::IsRunning == false` reached the old way). Before this field
+existed, a confirmed-not-running entry was indistinguishable from any other
+zero-`consecutiveFailures` bail-out, so `NextResolveDelayMs` had no way to
+tell it apart from a genuinely-still-pending one - it would poll it at the
+fast `ResolveBackoffMs(0)` (2s) cadence forever, since a bail-out never
+accumulates failures and so never reaches the terminal `kMaxResolveFailures`
+idle treatment either. `notRunning` closes that gap directly: it's checked
+everywhere `entry.hwnd` and terminal `consecutiveFailures` already are (see
+`NextResolveDelayMs`), so a confirmed-not-running button gets the same idle
+`kIdleResolveTickMs` cadence as a resolved one, and only reactivates on
+identity mismatch (a drag-reorder) or `TaskListButton::UpdateVisualStates`
+forcing a re-check (see "Removing `EVENT_OBJECT_SHOW`" below). It does not
+need a separate reset path back to `false`: `ResolveAndCacheButtonHwnd`
+recomputes the whole cache entry fresh on every resolve attempt, so a
+button that starts running again simply gets a fresh entry with
+`notRunning = false` the next time it's actually resolved.
 
 ## Live drag-follow
 
@@ -815,23 +898,27 @@ being dragged, plus every resolve tick, so this is a hot path — the
 non-blocking `PostMessage` matters specifically because it doesn't block on
 Explorer's UI thread pumping it.
 
-**`EVENT_OBJECT_SHOW` handling, in detail**: a real top-level window
-becoming visible is what a pinned-but-not-running app launching looks like
-— nudge the resolve timer to run right away, and force it to ignore each
-negatively-cached entry's own backoff (see `g_forceResolveUnresolved`
-above), instead of leaving it to the backoff schedule. That schedule is
-kept as a fallback — this is a fast path on top of it, not a replacement
-for it, in case a launch is ever reached through a code path that
-legitimately doesn't produce this event. Leading-edge throttled the same
-way the location-change branch is: this event fires for every top-level
-window becoming visible anywhere on the system, unthrottled, so an app that
-opens several windows at once (or a burst of unrelated launches) would
-otherwise schedule a full resolve pass — a blocking marshal onto Explorer's
-UI thread plus a repeater walk and an `AutomationProperties::GetName` per
-button — for every single one. No trailing timer is needed the way
-drag-follow has one: unlike a window's final drop position, `arm(0)` just
-needs to run once to pick up every currently-pending button, so missing the
-last event in a burst costs nothing.
+**`TaskListButton::UpdateVisualStates` handling, in detail** (round 29;
+see "Removing `EVENT_OBJECT_SHOW`" below for what this replaced): a
+visual-state transition on a taskbar button — which includes a
+pinned-but-not-running app transitioning to running — nudges the resolve
+timer to run right away, and forces it to ignore each negatively-cached
+entry's own backoff (see `g_forceResolveUnresolved` above), instead of
+leaving it to the backoff schedule. That schedule is kept as a fallback —
+this is a fast path on top of it, not a replacement for it, in case a
+launch is ever reached through a code path that doesn't produce this call,
+or on a Windows build where the symbol didn't resolve at all (it's
+optional — see `HookTaskbarViewDllSymbols`). Leading-edge throttled the
+same way the location-change branch is: this hook fires on every
+visual-state transition of every taskbar button (hover, press, and
+running/not-running alike), not just the one this mod cares about, so a
+burst of unrelated UI activity would otherwise schedule a full resolve
+pass — a blocking marshal onto Explorer's UI thread plus a repeater walk
+and an `AutomationProperties::GetName` per button — for every single call.
+No trailing timer is needed the way drag-follow has one: unlike a window's
+final drop position, `arm(0)` just needs to run once to pick up every
+currently-pending button, so missing the last event in a burst costs
+nothing.
 
 **Drag-follow trailing timer, in detail**: the throttle is leading-edge
 only, so the final location-change event of a drag/move — the one carrying
@@ -890,11 +977,14 @@ genuinely required, not optional).
 
 ## Mod lifecycle
 
-**Why the WinEvent hooks run on a dedicated mod-owned thread**:
+**Why the WinEvent hook runs on a dedicated mod-owned thread**:
 `EVENT_OBJECT_LOCATIONCHANGE` fires for every window move on the entire
-system — "thousands of raw events within seconds" has been observed — and
-`EVENT_OBJECT_SHOW` (added for the resolve-timer fast path) is nearly as
-frequent. `WINEVENT_OUTOFCONTEXT` delivers callbacks on whichever thread
+system — "thousands of raw events within seconds" has been observed (this
+used to also register `EVENT_OBJECT_SHOW`, nearly as frequent; round 29
+removed it - see "Removing `EVENT_OBJECT_SHOW`" below - but
+`EVENT_OBJECT_LOCATIONCHANGE` alone already justifies keeping this off the
+shell's own thread). `WINEVENT_OUTOFCONTEXT` delivers callbacks on whichever
+thread
 called `SetWinEventHook`, and only if that thread pumps messages;
 registering on `g_hTaskbarWnd`'s own thread would put all of that — plus
 `WinEventProc`'s own filtering calls on each one — in direct contention
@@ -984,10 +1074,15 @@ module's code.
 
 **`kResolveBackoffCeilingMs`**: the capped exponential backoff is a
 fallback safety net for a pinned-but-not-running app's button, in case its
-launch is ever reached through a path that doesn't produce
-`EVENT_OBJECT_SHOW` (`WinEventProc`'s fast path normally re-resolves it
-immediately). The 30-minute ceiling keeps this fallback from becoming a
-source of frequent synthetic clicks itself.
+launch is ever reached through a path that doesn't produce a
+`TaskListButton::UpdateVisualStates` call, or on a build where that symbol
+didn't resolve (the fast path normally re-resolves it immediately - see
+"Removing `EVENT_OBJECT_SHOW`" below). The 30-minute ceiling keeps this
+fallback from becoming a source of frequent synthetic clicks itself. Since
+round 29, this ceiling mostly matters for a genuinely still-failing
+*running* app's button - a confirmed not-running one now goes idle instead
+of climbing this schedule at all (see `ButtonHwndCacheEntry::notRunning`
+below).
 
 **`Wh_ModInit`'s taskbar-view-already-loaded branch**: not gated on
 `HookTaskbarViewDllSymbols`' own return value here for the same reason as
@@ -1259,8 +1354,16 @@ directly in round 24 - the reviewer named three, all restored with a
 one-sentence conclusion plus the pointer. Folding the remaining ~30
 pointers back in would undo the comment-trimming pass itself, which was a
 separate, explicit, deliberate request from the mod's author two rounds
-earlier. Not attempted, since it reverses a decision made independently of
-this specific review round.
+earlier. Not attempted at the time, since it would have reversed a
+decision made independently of that specific review round without the
+author's own say-so.
+
+Round 29 raised the identical suggestion again, and this time the mod's
+author explicitly asked for it to be addressed - see "Round 29's optional
+items" below for what that turned into: a partial, selective fold (the
+pointers that were genuinely bare, not the majority that already carried
+real inline reasoning), keeping `RATIONALE.md` as the long-form companion
+throughout rather than reversing the round-23 trim wholesale.
 
 **Dropping overflow task-list buttons to native position instead of
 letting a crowded side's icons overlap.** Raised by a reviewer as an
@@ -1347,7 +1450,10 @@ through and dispatch a second, redundant group-path click too).
 still advances either way, so a persistently-bailing-out entry - like a
 pinned-not-running app for its entire session - keeps retrying forever at
 `ResolveBackoffMs(0)`'s flat 2s cadence, cheap and indefinite, rather than
-escalating toward a cap that was never meant to apply to it). Separately,
+escalating toward a cap that was never meant to apply to it - round 29,
+below, later replaced "cheap and indefinite" with genuinely idle for the
+specific not-running case, once a cheap enough running-state signal existed
+to justify it). Separately,
 `NextResolveDelayMs` now treats `consecutiveFailures >= kMaxResolveFailures`
 exactly like an already-resolved entry (`anyIdleWorthy`, not `anyPending`)
 - both conditions mean "`ResolvePendingButtonHwnds` will never move this
@@ -1359,3 +1465,222 @@ one specific button, and the pre-existing session-wide
 `kClickSentinelMissesBeforeBroken` latch already trips the whole path
 broken after just 3), but `NextResolveDelayMs` has to be correct
 regardless of how rarely the state it's guarding against actually occurs.
+
+## Removing `EVENT_OBJECT_SHOW`: `TaskListButton::UpdateVisualStates` and
+the not-running pre-check (round 29)
+
+Round 29's review raised two related but distinct costs in the HWND-
+resolution chain, both hitting hardest for the ordinary case of a pinned
+app that isn't currently running:
+
+1. Every 2 seconds, forever, for as long as that button exists,
+   `ResolvePendingButtonHwnds` ran the *entire* group-path chain -
+   `TryGetItemFromContainer<TaskListGroupViewModel>`, `IsMultiWindow`
+   (itself calling `ITaskGroup::IsRunning` internally, hooked to capture
+   its `this`), then `ITaskGroup::IsRunning` again for the real answer -
+   only to learn, every time, what was already true the previous 2
+   seconds: the app still isn't running. `ResolveHwndFromIndividualTaskItem`
+   was already cheap for this case (see the "Two `kMaxResolveFailures` bugs
+   ..." section above - `TryGetItemFromContainer<TaskListWindowViewModel>`
+   fails fast for a button with no window, before ever reaching
+   `ReportClicked`), so this cost was specific to the group path.
+2. `EVENT_OBJECT_SHOW` - a `SetWinEventHook` registration for every
+   top-level window becoming visible *anywhere on the system* - existed
+   solely to nudge the resolve timer the instant a pinned app actually
+   launched. That's a lot of desktop-wide event traffic to buy one signal
+   about this taskbar's own buttons specifically.
+
+Both were addressed by moving to two real primitives from
+`Taskbar.View.dll`, cross-checked against `taskbar-labels.wh.cpp` (a
+published Windhawk mod using both against the exact same
+`winrt::Taskbar::implementation::TaskListButton` class) rather than
+guessed:
+
+**`TaskListButton::get_IsRunning`** (symbol:
+`winrt::impl::produce<TaskListButton, ITaskListButton>::get_IsRunning`) -
+a plain accessor (registered with no hook function, like
+`CWindowTaskItem::GetWindow`), called directly off the XAML element itself:
+`TaskListButton_get_IsRunning_Original(get_abi(element.as<IUnknown>()),
+&running)`. `TaskListButtonIsRunning` wraps this and is called first thing
+inside `ResolveHwndFromTaskListButton`, before either path - so a
+not-running button now costs one direct property read instead of the whole
+group-path chain, and the existing `ITaskGroup::IsRunning` check inside
+`ResolveHwndFromTaskGroup` is left in place as a second, independent
+confirmation for whatever's still reached it (defense in depth, not
+redundancy - the two accessors are different objects at different layers,
+and there's no proof they can never transiently disagree). The `.as<IUnknown>()`
+QueryInterface (not a raw reinterpret-cast of the element's own default-
+interface pointer, unlike the `TryGetItemFromContainer` call sites
+elsewhere in this file) matches `taskbar-labels.wh.cpp`'s exact calling
+convention for this specific symbol - copied deliberately rather than
+assumed equivalent, since a "produce" trampoline's expected `this` pointer
+is an ABI detail of that specific vtable slot, not something safe to infer
+from how a *different* symbol in this file happens to be called.
+Optional, like the rest of the resolution chain: if a future Windows build
+renames it, `TaskListButtonIsRunning` returns `true` (assume running, i.e.
+skip nothing), which is exactly this mod's pre-round-29 behavior.
+
+**`TaskListButton::UpdateVisualStates`** (symbol:
+`winrt::Taskbar::implementation::TaskListButton::UpdateVisualStates`,
+`private`) - hooked (unlike `get_IsRunning`) because there's no other way
+to observe *when* a state transition happens, only read the current state
+on demand. The hook calls through to the real implementation first, then
+does exactly what `WinEventProc`'s old `EVENT_OBJECT_SHOW` branch did:
+leading-edge-throttled (150ms, via the new `g_lastUpdateVisualStatesArm`),
+sets `g_forceResolveUnresolved` and calls `ArmButtonHwndResolveTimer(0)`.
+Unlike `EVENT_OBJECT_SHOW`, this fires only for this taskbar's own XAML
+buttons (in-process hook on a specific vtable slot, not a desktop-wide
+`WinEventHook`), and covers strictly more than "a pinned app just
+launched" - any visual-state change, including running/not-running in
+either direction - though it also fires for states this mod doesn't care
+about at all (hover, press), which is exactly why the throttle still
+matters here. This hook runs on the taskbar/XAML UI thread (the same
+thread `ArrangeOverride` already calls `ArmButtonHwndResolveTimer` from),
+not the dedicated WinEventHook thread `EVENT_OBJECT_SHOW`'s throttle
+variable used to live on - hence `g_lastUpdateVisualStatesArm` being a
+plain, not `std::atomic`, `ULONGLONG`: exactly one thread ever touches it,
+same as `g_lastDragFollowInvalidate` on its own (different) thread.
+Optional; if it's ever missing, the fast path is simply gone and every
+button - not just not-running ones - falls back to the pre-round-29
+`ResolveBackoffMs` capped-backoff schedule, the same degraded mode this
+mod already tolerated for a launch that reached `EVENT_OBJECT_SHOW`
+through an unexpected path. No FrameworkElement is ever extracted from the
+hook's `pThis` (`taskbar-labels.wh.cpp` does, via a fixed member-pointer
+offset, to look up its own per-button customization) - this mod's use only
+needs a global "something changed, go recheck everything" nudge, since
+`ResolvePendingButtonHwnds` already walks every button each pass, so
+skipping that extraction avoids relying on an unverified struct-layout
+offset for no benefit.
+
+**Why the 2-second poll wasn't fully eliminated, only slowed to the idle
+cadence**: `ButtonHwndCacheEntry::notRunning` (see above) makes
+`NextResolveDelayMs` treat a confirmed-not-running entry as idle-worthy,
+so the *shared* resolve timer (one timer for every button, not one per
+button) only fires every `kIdleResolveTickMs` (30s) once nothing else is
+genuinely pending - at which point `ResolvePendingButtonHwnds`' own
+`backoffElapsed` check (unchanged; still `ResolveBackoffMs(0)` = 2s) is
+trivially satisfied by the time 30s have passed, so the button still gets
+rechecked, just at 1/15th the frequency, and via the now-cheap pre-check
+rather than the old chain. A purely event-driven design (zero polling,
+relying only on `UpdateVisualStates`) was considered and rejected: that
+hook is a `private`, unversioned symbol - a materially higher risk of
+breaking on some future Windows build than the file's one genuinely
+required symbol, `ArrangeOverride` - and this mod's established pattern
+(see `kMaxPlanStalenessMs`'s backstop for `g_planDirty` elsewhere in this
+file) is to never let a single mechanism be the only thing standing
+between "up to date" and "silently stuck," however unlikely that
+mechanism is to fail. Keeping the periodic idle recheck, rather than
+relying solely on the event, means a hook that fails to resolve on some
+future build degrades to "not-running buttons recheck every 30s instead of
+being nudged instantly" - worse, but not broken, and no different in kind
+from the drag-reorder rebind detection that idle tick already exists for.
+
+## Round 29's optional items
+
+The round 29 review's main-body findings (unattended-probing risk,
+resolve-loop idling, the `taskbar-start-button-position` overlap) are
+covered above and in the source's own comments. Its collapsed, explicitly
+optional sections raised five "your call" polish items plus two
+non-critical functionality notes; the mod's author asked for all of them
+to be addressed in the same session, live-tested separately. What each
+turned into:
+
+**`EnsureTaskbarWnd` now snapshots `g_hTaskbarWnd` into a local at the
+top**, used for every read (and the final return) instead of six direct
+reads of the atomic. Purely a comment/contract-consistency fix - the
+function is the variable's sole writer, so there was never a real bug -
+but the variable's own comment asks every caller with more than one read
+to do this, and this function didn't.
+
+**`Wh_ModBeforeUninit`'s comment no longer calls the pre-removal
+`SendMessage` an "immediate snap-back."** `InvalidateArrange`/
+`InvalidateMeasure` only mark the tree dirty; the actual re-Arrange runs
+on XAML's own next layout pass, by which point `g_unloading` already makes
+`IUIElement_Arrange_Hook` fall through to native positioning anyway - same
+end result, more accurate description of how it gets there.
+
+**`GetButtonAccessibleName`'s comment now states its own blind spot**:
+with "Combine taskbar buttons: Never," two windows of the same app produce
+two `TaskListButton`s with the identical accessible name, so an
+`ItemsRepeater` rebind between those two specifically wouldn't be caught
+by the `identity != it->second.identity` check elsewhere in this file -
+only a rebind onto a differently-named button is detected. Documentation
+only; no attempt was made to fix the underlying gap (there's no cheaper
+alternative identity signal available for a pinned-but-not-running button,
+which is exactly the case this identity check exists for in the first
+place).
+
+**Known limitations gained a Start-menu bullet**: this mod repositions the
+Start *button* only. Nothing decides where the Start *menu* itself opens,
+so with the taskbar's own alignment set to "Left" (rather than "Center,"
+where Windows' own default menu placement happens to already look right),
+the button sits at true center while the menu still opens at the left
+edge. Documentation only, matching how the `taskbar-start-button-position`
+overlap itself is handled - there's no exposed API to move WinUI's own
+Start flyout anchor from a Windhawk mod.
+
+**`SystemButtonContentWidth`'s "0 while unmeasured" race, fixed - but not
+exactly as the reviewer suggested.** The reviewer's suggestion was to give
+the Search/Task View/Widgets cluster width the same "only update when
+positive" treatment `g_lastStartWidth` already has. That doesn't actually
+transfer: Start is *never* legitimately 0, so "only update when positive"
+can't ever mask a real state for it, but the whole point of
+`SystemButtonContentWidth` reading the content child's `DesiredSize`
+instead of the outer element's `ActualWidth()` is that `DesiredSize`
+*genuinely does* read ~0 when a button is deliberately hidden via its
+negative-margin collapse trick - and Search/Task View/Widgets can be
+toggled hidden/shown live, without a mod reload, via ordinary taskbar
+settings. Applying "only update when positive" literally would make a
+live hide-toggle get permanently stuck reserving space for a
+now-nonexistent cluster, which is worse than the one-frame startup jitter
+being fixed. Implemented instead: `g_lastSystemButtonContentWidth`, a
+small per-element (not per-cluster) cache keyed the same way
+`g_lastArrangedTaskListWidth` is, consulted only when *both* the content
+child's `DesiredSize` *and* the outer element's own `ActualWidth()` read 0
+- the second condition is what distinguishes "genuinely hidden" (outer
+element has been through a real Arrange pass; its `ActualWidth()` is
+positive; a `DesiredSize` of 0 is trustworthy, matching the file's
+existing "just-realized element" pattern for Start/task-list buttons) from
+"still mid-realization" (outer element hasn't been arranged even once
+yet; a fallback to the last known width is the correct call, if one
+exists). This is treating an AI-review finding the way the standing
+instructions ask - verified, not applied blindly, since the literal
+version had a real, foreseeable regression for a live-toggleable Windows
+setting the naive fix's own author likely wasn't tracking.
+
+**The diagnostics machinery (`ResolveStats`/`LayoutPlanStats`/
+`ArrangePassStats`, four atomic WinEvent counters) was NOT trimmed**,
+despite being explicitly called out as heavy for a shipped mod. Every
+single field in it has demonstrated real, specific diagnostic value either
+in this file's own crash history (`skippedReentrant` and
+`invalidateExceptions` were added in direct response to real crashes,
+specifically to make a recurrence visible - see the drag-follow crash
+narrative above) or within round 29's own live-test cycle (`hwndResolved`,
+`ok`/`fail`, and `invalidated` were all read directly off `Wh_Log` output
+to confirm the click-gate behavior and drag-follow side-switching worked
+correctly). This mod has no formal test suite and no maintenance channel
+other than a user sharing exactly these `Wh_Log` lines - trimming the one
+tool that's repeatedly proven itself for exactly that purpose would trade
+a modest, largely inert (a few integer increments per pass) runtime cost
+for materially worse future debuggability. Declined with this reasoning
+recorded rather than silently skipped, consistent with the standing
+instruction to say so when a finding doesn't hold up rather than changing
+working code to satisfy it.
+
+**~15 of the review's ~39-46 `RATIONALE.md` pointers were folded back
+into inline comments** (`EnsureTaskbarWnd`'s retry rationale, the
+`g_winEventThreadMutex`/dedicated-thread/`TaskbarWndSubclassProc`
+threading rationale, the `GetTaskItemsArrayOffset`/`ComputeSystemButtonX`/
+drag-follow-trailing-timer failure-mode specifics, and a few others) -
+specifically the ones that were genuinely bare pointers with no inline
+reasoning at all, not the majority that already explained their own
+"why" and used the pointer only for genuinely-extra history or depth. This
+was raised and explicitly declined back in round 25 (see "Two round-25
+suggestions deliberately left as-is" above) on the grounds that fully
+reversing the round-23 trim wasn't this file's call to make unilaterally -
+round 29 asked again, and this time the mod's author explicitly requested
+it, which is exactly the missing authorization. `RATIONALE.md` remains the
+long-form companion throughout; nothing was deleted from it, and most
+pointers - the ones already carrying real inline context - were left
+untouched rather than mechanically touching all of them regardless of
+whether folding would add anything.

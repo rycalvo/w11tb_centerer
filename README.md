@@ -58,7 +58,19 @@ then classified the same way as a pinned-but-not-running one instead.
   Arrange call wins for that pass. This mod's `systemButtonsPlacement:
   far-left` setting covers the same "keep everything else out of Start's
   way" goal that mod's `otherSystemButtonsOnTheLeft` option does, so
-  there's no reason to run both together.
+  there's no reason to run both together. This mod is intentionally scoped
+  to true screen-center plus position-based icon splitting specifically -
+  not a general Start-position picker - so this conflict is a documented
+  incompatibility to avoid rather than something planned to be resolved by
+  merging the two mods or their positioning logic.
+- **The Start menu itself doesn't follow the repositioned Start button.**
+  This mod only moves the Start *button* - nothing decides where the Start
+  *menu* opens. With the taskbar's own "Taskbar alignment" set to
+  "Center", the menu happens to open near screen-center anyway since
+  that's where Windows expects it by default, but with alignment set to
+  "Left", the button sits at true center while the menu still opens at the
+  left edge. There's no exposed way to move the menu's own anchor point
+  the way this mod moves the button.
 - **A very crowded side compresses instead of overflowing cleanly.** If
   enough app icons pile up on one side that they'd run into the system
   tray/clock on the right (or, in "far left" placement, into Search/Task
@@ -96,19 +108,26 @@ then classified the same way as a pinned-but-not-running one instead.
 - The "resolve which HWND a taskbar button represents" step reuses a
   technique from other taskbar-reordering mods (synchronously reporting a
   sentinel "click" to the taskbar's internal click handler, which is
-  intercepted before it does anything, to read back the window handle). It
-  runs on a periodic timer rather than inline during layout, and Arrange
-  only ever reads whatever the timer has already cached - running it
-  synchronously from inside the taskbar's own layout pass was the
+  intercepted before it does anything, to read back the window handle) -
+  but unlike those mods, which only ever dispatch it from an actual user
+  gesture on one specific button, this mod dispatches it unattended, on
+  its own background timer, against every button it hasn't resolved yet.
+  It runs on a periodic timer rather than inline during layout, and
+  Arrange only ever reads whatever the timer has already cached - running
+  it synchronously from inside the taskbar's own layout pass was the
   confirmed cause of an explorer.exe crash (specifically when Windows'
   "show taskbar apps on" setting is anything other than "All taskbars",
   since that's when a window moving across monitors structurally adds/
   removes taskbar buttons rather than just repositioning them). As a
   further safeguard, the very first such probe of a session is held back
   until a real (non-sentinel) click has been seen passing through the same
-  interception point - so a running app's icon may briefly show on its
-  default side, rather than by window position, until you click any
-  taskbar button once.
+  interception point, and any single miss after that latches this mod's
+  probing off entirely on that path (see `Wh_Log` for which) - so a
+  running app's icon may briefly show on its default side, rather than by
+  window position, until you click any taskbar button once, and if a
+  future Windows update ever changes how that interception works, the
+  worst case is icons freezing on their default side rather than the mod
+  silently clicking things on its own.
 - **Taskbar buttons can disappear when a display is deactivated** (via
   Settings, unplugging, or a third-party display on/off tool) - if
   "Taskbar behaviors > When using multiple displays, show my taskbar apps
