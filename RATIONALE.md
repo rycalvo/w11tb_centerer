@@ -1845,3 +1845,265 @@ single-miss click-sentinel latch (round 29) costing position tracking for
 the rest of the session with only a `Wh_Log` line to explain it is a
 known, deliberate tradeoff already reasoned through at length above - the
 reviewer flagged it only as "worth knowing," not asking for a change.
+
+## Round 31: replacing the desktop-wide WinEventHook, and full self-containment
+
+Round 31 was the largest single round yet - one architectural mechanism
+replacement, a full pass making the file's ~50 "See RATIONALE.md" pointers
+self-contained (this doc no longer being required reading to understand
+any single comment), and about a dozen smaller correctness/clarity fixes.
+Everything below was confirmed against the actual code (or, in one case,
+the Windhawk SDK's own header) before being acted on, not applied blindly.
+
+**Finding 1 (required): the desktop-wide `EVENT_OBJECT_LOCATIONCHANGE`
+WinEventHook was a real, externalized cost with a cheaper alternative.**
+`WinEventHookThreadProc` registered
+`SetWinEventHook(EVENT_OBJECT_LOCATIONCHANGE, EVENT_OBJECT_LOCATIONCHANGE,
+nullptr, WinEventProc, 0, 0, WINEVENT_OUTOFCONTEXT)` with `idProcess`/
+`idThread` both 0 - every process on the desktop. `EVENT_OBJECT_LOCATIONCHANGE`
+is one of the highest-volume WinEvents there is (cursor, caret, every
+window move/size/scroll), so simply having it registered made every
+unrelated process on the system generate and marshal a notification this
+mod discarded almost all of anyway - thousands of raw events/sec observed,
+per this file's own former diagnostics, against `WinEventProc`'s
+`idObject`/`g_resolvedHwnds` filters.
+
+The mod never actually needed a global event feed: it already knows the
+small set of HWNDs it cares about (`g_resolvedHwnds`, typically a handful),
+and drag-follow was already collapsed to at most one relayout per ~150ms
+by the trailing timer. Replaced with a direct poll: a `SetTimer` on the
+existing background thread (`DragFollowPollTimerProc`, `kDragFollowPollMs`
+= 150) walks `g_resolvedHwnds` and calls `GetWindowRect` on each -
+`GetWindowRect` is a direct win32k.sys read, not a cross-process message
+send, so the entire cost moves onto this mod's own dedicated thread
+instead of externalizing it onto every other process on the system. A new
+`g_lastPolledRect` map (thread-exclusive, no lock needed) detects an
+actual position change per window and only invalidates layout when one is
+found, which the old `WinEventProc` couldn't do (it invalidated on every
+raw event that passed its filters, not just ones representing a real
+change). `g_locationChangeHook`, `DragFollowTrailingTimerProc`, and
+`WinEventProc` are gone; `g_dragFollowTrailingTimerId`/
+`g_lastDragFollowInvalidate` are gone too, no longer needed once the poll
+itself is the single source of both "did anything change" and "when did
+we last check."
+
+The poll also takes the refinement the review pointed out as a bonus of
+this approach ("it would additionally let you invalidate only when a
+window's *side or distance actually changed* instead of on every
+intermediate position"), in the strongest form the classification
+actually permits. `ClassifyByWindowPositionCached` derives *both* outputs
+that matter - the side (window center vs. the screen's center line) and
+`distanceFromCenter` (which orders same-side icons) - from the window's
+horizontal center and nothing else. So comparing horizontal center alone
+is not an approximation of "did the layout-relevant state change," it is
+exactly that predicate: a vertical-only move, or a resize that leaves the
+center where it was, provably cannot change any icon's placement, and now
+fires no relayout at all (comparing whole rects, as the first cut did,
+fired one on every tick of such a drag). `g_lastPolledCenterX` stores
+`left + right` - twice the true center - since only equality matters and
+staying integral keeps the comparison exact. Minimized windows are
+skipped outright for the same reason: `GetWindowRect` reports a nonsense
+off-screen position for one, and `ClassifyByWindowPositionCached`
+deliberately freezes at the last pre-minimize classification instead of
+using it, so polling a minimized window could only ever produce
+relayouts that change nothing - two of them per minimize/restore cycle,
+which the old WinEventHook also produced and which now simply don't
+happen.
+
+The reviewer's alternative (scope the hook to `idProcess` of the windows
+actually being tracked, via `SetWinEventHook`'s own `idProcess` parameter)
+was considered and rejected: `g_resolvedHwnds` changes as buttons resolve
+and windows come and go, which would mean re-registering the hook (or one
+per tracked process) continuously - real complexity for a narrower win
+than simply not using WinEventHook at all for this.
+
+**Renaming the thread infrastructure.** Round 29 already removed this
+mod's other WinEventHook (`EVENT_OBJECT_SHOW`, replaced by
+`TaskListButton::UpdateVisualStates`); after this round's fix, zero
+WinEventHooks remain anywhere in the mod. Leaving `WinEventHookThreadProc`/
+`StartWinEventHook`/`StopWinEventHook`/`StopWinEventHookInternal`/
+`StopWinEventHookForToggle`/`g_winEventThread*` as names would now be
+actively misleading, so all of them were renamed to
+`BackgroundWorkerThreadProc`/`StartBackgroundWorkerThread`/
+`StopBackgroundWorkerThread`/`StopBackgroundWorkerThreadInternal`/
+`StopBackgroundWorkerThreadForToggle`/`g_backgroundWorkerThread*` via a
+prefix-substring-safe bulk rename (`StopWinEventHook` is itself a prefix
+of `StopWinEventHookInternal`/`StopWinEventHookForToggle`, so replacing
+the shorter identifier first correctly transforms the longer ones as a
+side effect). The two diagnostic counters were similarly renamed
+(`g_winEventRawCount` → `g_dragFollowPollCount`, `g_winEventInvalidateCount`
+→ `g_dragFollowInvalidateCount`), and the periodic stats `Wh_Log` line's
+`winEvents: raw=%d` label became `dragFollow: polls=%d` to match. This was
+slightly beyond the review's literal ask, but leaving stale WinEventHook
+naming in place after removing the last actual WinEventHook would have
+been exactly the kind of staleness this same review round was elsewhere
+asking to clean up.
+
+**Finding 2 (required): the readme understated the click-sentinel's real
+failure mode, and the PR description had drifted from the code.** The
+readme's "worst case" line only covered the failure mode where
+`CTaskListWnd::HandleClick` never resolves at all (probing bails out
+before dispatching anything - a real but benign "icons freeze on default
+side" outcome). The worse mode: if the hook installs and real clicks route
+through it (so `g_realTaskbarClickObserved` latches true) but a probe
+click somehow reaches the taskbar's actual handler unswallowed,
+`&g_clickSentinel` (a `WCHAR[]`) gets delivered as that handler's real
+`winrt::Windows::System::LauncherOptions const&` argument - the handler
+reads the sentinel string's bytes as an interface pointer, so the
+realistic worst case is a stray window activate/minimize or an access
+violation in explorer.exe. Fixed in both readme copies (`README.md` and
+the in-source `WindhawkModReadme` block, which must stay identical) and
+inlined into the click-sentinel dispatch function's own comment in the
+source, replacing what had been a bare "see RATIONALE.md for the
+failure-mode analysis" pointer.
+
+The PR description separately claimed the latch trips "after 3 consecutive
+unconfirmed misses" (code: `kClickSentinelMissesBeforeBroken = 1`, a
+single miss) and that probing was partly driven by `EVENT_OBJECT_SHOW`
+(removed in round 29, replaced by `TaskListButton::UpdateVisualStates`).
+Both corrected via `gh pr edit`, along with updating the worst-case
+description there too for the same reason as the readme.
+
+Also fixed while in the same area: the readme's Start-menu limitation
+("There's no exposed way to move the menu's own anchor point") reworded
+to note this is solvable, not a dead end -
+`taskbar-start-button-position.wh.cpp` already does exactly this by
+hooking `StartMenuExperienceHost.exe` and repositioning the menu window
+directly; this mod just doesn't do it today.
+
+**Finding 3 (required): full self-containment - every "See RATIONALE.md"
+pointer folded or dropped.** Round 29 had done a selective pass (~15 of
+the most bare pointers); this round's review reframed full
+self-containment as a main-body finding rather than optional, on the
+reasoning that a merged mod's future maintainer (who may not be the
+original author) shouldn't depend on a third-party repo staying up to
+understand any given comment. All ~48 remaining per-comment pointers were
+resolved - most were already fully self-contained once read closely and
+just needed the trailing "See RATIONALE.md" clause dropped; a handful
+(the click-sentinel dispatch failure mode above, `g_forceResolveUnresolved`'s
+"why unconditional forcing was a bug" story, `ResolveAndCacheButtonHwnd`'s
+crash-dump trigger conditions, `TaskbarWndSubclassProc`'s "unlike an
+earlier design" note about the removed `RunFromWindowThread` fallback)
+needed the actual reasoning inlined from this doc. This doc itself is
+unaffected in role or structure - it remains the long-form companion for
+anyone who wants more background than a comment carries on its own, which
+is now how the top-of-file pointer to it is worded, rather than promising
+answers to any specific "see RATIONALE.md" comment (none remain).
+
+**Optional items addressed:**
+
+- **`HookSymbols`' return value doesn't mean what several comments
+  claimed.** Verified directly against `windhawk_utils.h`'s own doc
+  comment (`@param optional If set to true, the absence of this symbol
+  isn't considered an error`): a missing *optional* symbol never affects
+  `HookSymbols`' boolean return value, only a missing *required* one does.
+  Several comments (in `HandleLoadedModuleIfTaskbarView`, and the
+  `Wh_ModInit` branch for a taskbar view module already loaded at init
+  time) claimed the opposite - that a single missing optional
+  HWND-resolution symbol "would otherwise fail this ENTIRE mod's load."
+  Not gating on the return value was always the right call (the one
+  symbol that must load, `ArrangeOverride`, is checked directly instead),
+  just not for that reason - both comments now state the real one. This
+  also meant the "Missing (optional...)" diagnostic `Wh_Log` blocks in
+  `HookTaskbarDllSymbols`/`HookTaskbarViewDllSymbols`, both gated on
+  `if (!ok)`, could only ever fire when a *required* symbol failed -
+  exactly when naming which optional symbol is ALSO missing is least
+  useful, and never in the scenario the diagnostic exists for (an optional
+  symbol quietly disappearing after a Windows update while every required
+  symbol still resolves). Both now compute `anyOptionalMissing` directly
+  from the resolved-pointer checks and log unconditionally on that instead
+  of on `!ok`. While fixing `HookTaskbarDllSymbols`' version, noticed its
+  listed-symbols string only ever named 3 of the file's 7 actually-optional
+  symbols (missing `CTaskListWnd::HandleClick` - the click interception
+  point itself - along with the two `GetWindow` overloads and the
+  `CImmersiveTaskItem` vftable); expanded it to cover all 7, since a
+  diagnostic that fires unconditionally but silently omits the most
+  important symbol it could report on isn't much of a fix.
+
+- **Teardown-serializing mutex added to `StopBackgroundWorkerThreadInternal`.**
+  The function nulled `g_backgroundWorkerThread` under
+  `g_backgroundWorkerThreadMutex` and then waited on the thread handle
+  *outside* that lock. A second concurrent call (e.g. `Wh_ModUninit`'s
+  permanent stop arriving while a live `trackWindowPositions` toggle-off
+  was still waiting) would see the already-nulled pointer and return
+  immediately, letting its caller proceed while the worker thread was
+  still executing mod code - right before Windhawk unmaps it. Not
+  currently believed reachable in practice (`Wh_ModBeforeUninit`'s two
+  `SendMessage` calls plus `RemoveWindowSubclassFromAnyThread` already
+  serialize behind the taskbar thread's own pump), but a one-line
+  `static std::mutex teardownMutex` wrapping the whole function turns that
+  into a structural guarantee instead of an argument.
+
+- **`g_lastSystemButtonContentWidth` pruning.** The map is keyed by the
+  XAML element's raw ABI pointer with no reference held, and previously
+  persisted across calls with no pruning at all - a taskbar/XamlRoot
+  recreate could destroy a system button and let its address be reused by
+  an unrelated new one, which would then silently inherit the destroyed
+  element's stale cached width (worse than the "costs nothing" framing the
+  old comment used, since this is a correctness risk, not just unbounded
+  memory). Fixed inside `RecomputeLayoutPlan`, right after `childInfos` is
+  built: computes the current pass's live system-button keys and erases
+  any cache entry not among them, mirroring the pruning pattern already
+  used for `g_lastKnownWindowClassification` and `g_lastPolledRect`
+  elsewhere in the file.
+
+- **`g_anyButtonNeedsRecheck`'s comment overclaimed a steady state that
+  essentially never occurs.** The comment said hover churn "costs nothing"
+  once the flag reaches its common steady state of "every button resolved
+  or given up." In practice a pinned-but-not-running button - present on
+  essentially every real Windows 11 taskbar by default - never advances
+  past 0 `consecutiveFailures` (a `notRunning` entry never dispatches a
+  click), so it keeps the flag true indefinitely, meaning every hover
+  sweep still triggers a full `ResolvePendingButtonHwnds` pass. The
+  reviewer's suggested code fix (excluding `notRunning` entries from the
+  flag) was considered and declined: that would silently regress round
+  29's whole point for this case - losing the fast, `UpdateVisualStates`-
+  driven detection of a pinned app starting and falling back to the 30s
+  idle tick instead - to optimize an already-cheap pass. Fixed the comment
+  only, to describe the actual (still-intentional) behavior instead of a
+  steady state that doesn't hold with a pinned-not-running app present.
+
+- **`ComputeSystemButtonX`'s adjacent-left comment had its own conclusion
+  backwards.** It said the taskbar-order-earliest button "ends up closest
+  to Start." Working through the math (`widthAfter = clusterWidth -
+  widthBefore - ownWidth`, then `X = startCenterX - startWidth/2 - gap -
+  widthAfter - ownWidth`) for both the earliest button (`widthBefore = 0`,
+  so `widthAfter` is largest) and the latest one confirms the earliest
+  button actually lands at the *outermost* (farthest-from-Start) slot -
+  which is what the comment's own second clause (reading left-to-right
+  matches far-left mode's order) already correctly depended on. Fixed the
+  first clause to say "farthest from Start (the outermost slot)."
+
+- **A benign startup race no longer logs as an error.** Live testing this
+  round surfaced `ArmButtonHwndResolveTimer: PostThreadMessage failed,
+  error=1444` (`ERROR_INVALID_THREAD_ID`) on every single mod startup - a
+  pre-existing condition, not something this round introduced.
+  `StartBackgroundWorkerThread` publishes the worker's thread id the
+  moment `CreateThread` returns, but a thread has no message queue until
+  it first calls a message function (`PeekMessage`, at the top of
+  `BackgroundWorkerThreadProc`), and `EnsureTaskbarWnd` reaches its
+  `ArmButtonHwndResolveTimer(0)` call in the very same pass that started
+  the thread. The nudge was redundant regardless - the thread proc arms
+  the first resolve itself - so this now suppresses that one error code
+  and keeps logging every other. Nothing about the behavior changed; the
+  log just no longer opens every session with a failure that isn't one.
+
+- **Review-history narration stripped from several comments** (round
+  29/30 attributions in `TaskListButtonIsRunning`'s comment,
+  `ResolveHwndFromTaskListButton`'s `awaitingFirstClick` comment,
+  `ButtonHwndCacheEntry::notRunning`'s comment, `TaskListButton_UpdateVisualStates_Hook`'s
+  re-arm comment, and `DragFollowPollTimerProc`'s own banner) while
+  keeping every conclusion - a file read by a future maintainer, not a
+  past reviewer, shouldn't carry "round 30 review finding:" as if it were
+  a changelog.
+
+**Not acted on** (explicitly declined, matching round 25's precedent for
+the same item): the crowded-side compression fallback in
+`PlanTaskListButtons` still lets icons overlap once `compressibleAvailable`
+goes negative, rather than clamping the scale at a floor and letting
+outermost icons run past the bound or fall through to native positioning.
+Already documented in the readme as a known limitation; a genuinely
+crowded taskbar is an edge case, and the suggested change (a new
+compression floor plus a decision about what happens to icons past it)
+is new design surface, not a fix to something broken, the same
+reasoning round 25 used to decline reshaping this same fallback.

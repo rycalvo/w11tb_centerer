@@ -23,8 +23,8 @@ _The same window moved right of screen-center - its icon moves with it,
 to the right of Start._
 
 When you drag a window across the center line of the screen, its taskbar
-button switches sides to follow it. Side-switching is driven by a global
-window-location-change listener and is best-effort: it happens shortly
+button switches sides to follow it. Side-switching is driven by a periodic
+poll of tracked windows' positions and is best-effort: it happens shortly
 after a drag/move settles, not on every intermediate pixel of the drag.
 
 Search, Task View and Widgets can either stay at the far left edge, or move
@@ -33,7 +33,7 @@ right next to Start on whichever side you prefer.
 The window-tracking behind position-based splitting and drag-follow can be
 turned off entirely with `trackWindowPositions`, if you'd rather keep just
 the centered Start button and system-button placement with no background
-probing of taskbar buttons and no system-wide event hook - every app is
+probing of taskbar buttons and no periodic position polling - every app is
 then classified the same way as a pinned-but-not-running one instead.
 
 ## Known limitations (please read before reporting issues)
@@ -69,8 +69,10 @@ then classified the same way as a pinned-but-not-running one instead.
   "Center", the menu happens to open near screen-center anyway since
   that's where Windows expects it by default, but with alignment set to
   "Left", the button sits at true center while the menu still opens at the
-  left edge. There's no exposed way to move the menu's own anchor point
-  the way this mod moves the button.
+  left edge. This is a solvable limitation rather than a permanent one -
+  `taskbar-start-button-position.wh.cpp` repositions the menu itself by
+  hooking `StartMenuExperienceHost.exe` - just not something this mod
+  does today.
 - **A very crowded side compresses instead of overflowing cleanly.** If
   enough app icons pile up on one side that they'd run into the system
   tray/clock on the right (or, in "far left" placement, into Search/Task
@@ -124,10 +126,14 @@ then classified the same way as a pinned-but-not-running one instead.
   interception point, and any single miss after that latches this mod's
   probing off entirely on that path (see `Wh_Log` for which) - so a
   running app's icon may briefly show on its default side, rather than by
-  window position, until you click any taskbar button once, and if a
-  future Windows update ever changes how that interception works, the
-  worst case is icons freezing on their default side rather than the mod
-  silently clicking things on its own.
+  window position, until you click any taskbar button once. That gate
+  only covers *before* interception is ever confirmed working, though: if
+  a future Windows update breaks interception in a way that still lets a
+  probe reach the taskbar's real click handler afterward, the probe's
+  sentinel value gets delivered as that handler's real argument, and the
+  realistic worst case is a stray window activate/minimize or an access
+  violation in explorer.exe, not merely icons freezing on their default
+  side.
 - **Taskbar buttons can disappear when a display is deactivated** (via
   Settings, unplugging, or a third-party display on/off tool) - if
   "Taskbar behaviors > When using multiple displays, show my taskbar apps
