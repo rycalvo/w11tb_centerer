@@ -1684,3 +1684,164 @@ long-form companion throughout; nothing was deleted from it, and most
 pointers - the ones already carrying real inline context - were left
 untouched rather than mechanically touching all of them regardless of
 whether folding would add anything.
+
+## Round 30: the click-gate poll, and a lossless UpdateVisualStates debounce
+
+Round 30 reviewed round 29's actual shipped code (not a diff) and found
+two things genuinely missed at the time - both confirmed correct against
+the code before being fixed, not applied blindly.
+
+**Finding 1: `g_realTaskbarClickObserved`'s gate had exactly the same
+"permanent 2s poll" shape item 2 had just fixed for pinned-not-running
+buttons - just for a different bail-out reason.** Before the session's
+first real (non-sentinel) taskbar click, `ResolveHwndFromIndividualTaskItem`/
+`ResolveHwndFromTaskGroup` both bailed at their own `g_realTaskbarClickObserved`
+check with `clickDispatched` staying `false` - meaning `consecutiveFailures`
+never advanced past 0, so `NextResolveDelayMs` saw every single button
+(running ones included, unlike the `notRunning` case) as genuinely pending
+at the fast `ResolveBackoffMs(0)` = 2s cadence, for as long as the session
+went without a click. For a user who launches everything from Start or
+switches windows with Alt+Tab, that could be the entire session - a
+poll that costs a full repeater walk plus a `get_IsRunning` call per
+running button, on the shell UI thread, forever.
+
+Fixed by hoisting the `g_realTaskbarClickObserved` check out of both
+`ResolveHwndFromIndividualTaskItem`/`ResolveHwndFromTaskGroup` (removed
+from each; they now rely entirely on their sole caller,
+`ResolveHwndFromTaskListButton`, having already checked it - there is no
+other call site) and into `ResolveHwndFromTaskListButton` itself, ahead of
+even the `TaskListButtonIsRunning` pre-check, since neither path can do
+anything at all until the click gate opens regardless of running-state. A
+new `ButtonHwndCacheEntry::awaitingFirstClick` field records the reason,
+treated by `NextResolveDelayMs` exactly like `notRunning` (idle cadence,
+not the fast one). Separately, `CTaskListWnd_HandleClick_Hook`'s
+non-sentinel branch now does `g_realTaskbarClickObserved.exchange(true)`
+and, on the transition from `false`, immediately sets
+`g_forceResolveUnresolved` and calls `ArmButtonHwndResolveTimer(0)` - so
+every button that was parked waiting for this exact gate gets rechecked
+the instant the click happens, rather than up to 2 seconds later. This
+needed two forward declarations (`extern std::atomic<bool>
+g_forceResolveUnresolved;` and `void ArmButtonHwndResolveTimer(DWORD);`)
+ahead of the click hook, since both are otherwise defined later in the
+file than this hook is.
+
+Note the asymmetry with `notRunning`: an `awaitingFirstClick` entry still
+gets picked up by `TaskListButton_UpdateVisualStates_Hook`'s own
+force-resolve nudge too (via `g_anyButtonNeedsRecheck`, below) - that's
+harmless (a forced recheck on a button still awaiting the click gate just
+finds itself still gated and re-caches the same state), not a second,
+redundant fix for the same problem; the click hook's own immediate nudge
+is what actually matters for closing the gate promptly.
+
+**Finding 2: `TaskListButton::UpdateVisualStates`'s leading-edge throttle
+could silently drop the specific transition it existed to catch, while
+also running full resolve passes for pure hover noise once nothing was
+left to resolve.** The hook fires for every visual-state transition of
+every taskbar button - hover, press, focus, badges, not just running/
+not-running - so a 150ms leading-edge gate (`if (GetTickCount64() -
+g_lastUpdateVisualStatesArm < 150) return;`) could discard the one call
+that mattered (a pinned app's running transition) if it landed within
+150ms of an irrelevant one, with nothing left to ever re-arm afterward.
+Since that button's cache entry is `notRunning` - now idle-cadenced at
+30s - the icon could sit on its default side for up to 30 seconds. In the
+other direction, once every button is already resolved, ordinary mouse
+movement across the taskbar was still producing up to ~6-7 full resolve
+passes/second (a repeater walk plus per-button property reads, on the
+shell UI thread) for a hook that could find nothing new every single time.
+
+Fixed by removing the elapsed-time gate entirely and instead calling
+`ArmButtonHwndResolveTimer(150)` unconditionally on every call (still
+gated by `g_anyButtonNeedsRecheck`, see below). This isn't a regression to
+"no throttle" - `ArmButtonHwndResolveTimer` posts to the WinEventHook
+thread, whose message loop responds to each post with a `KillTimer`/
+`SetTimer(..., delayMs, ...)` re-arm (see `WinEventHookThreadProc`'s
+`kArmResolveNowMsg` case) - so each new call *resets* the pending timer's
+150ms countdown rather than adding a new one. A burst of calls therefore
+collapses into exactly one resolve pass, fired 150ms after the burst
+actually goes quiet: a lossless trailing-edge debounce, for free, without
+needing a second timer variable the way `DragFollowTrailingTimerProc`
+does for the exact same shape of problem on the drag-follow side. The old
+`g_lastUpdateVisualStatesArm` throttle variable is gone entirely - nothing
+reads elapsed time for this anymore.
+
+The "hover churn over an already-settled taskbar" half of the finding
+needed a separate mechanism, since debouncing alone doesn't stop a burst
+from producing at least one pass - `g_anyButtonNeedsRecheck`, a plain
+`bool` (not atomic: written only by `ResolvePendingButtonHwnds`, read
+only by the `UpdateVisualStates` hook, and both run exclusively on the
+taskbar thread, the same "single-thread-only, no marshal needed" pattern
+`g_buttonHwndCache` itself already relies on). Recomputed at the end of
+every `ResolvePendingButtonHwnds` pass: true if any cache entry has
+`!hwnd && consecutiveFailures < kMaxResolveFailures` - deliberately
+broader than `NextResolveDelayMs`'s own "pending" notion, since a
+`notRunning`/`awaitingFirstClick` entry counts as "still worth reacting to
+an event about" here even though it's idle for *polling* purposes; those
+are genuinely different questions (one is "should the periodic timer
+chase this on its own," the other is "if something just told us to look,
+is there any point looking"). Starts `true` so the very first
+`UpdateVisualStates` call of a session, before any resolve pass has run
+to compute a real answer, isn't skipped.
+
+**Two `NextResolveDelayMs`-adjacent comment corrections, both round-30
+optional findings confirmed accurate on inspection:**
+- The old comment claimed `NextResolveDelayMs`'s idle-worthy classification
+  "must exactly match" `ResolvePendingButtonHwnds`' `backoffElapsed` check
+  in every case. That's only true for the *terminal* case (`backoffElapsed`
+  structurally evaluates false forever once `consecutiveFailures` reaches
+  `kMaxResolveFailures`, so `NextResolveDelayMs` genuinely has to know to
+  stop chasing it independently, or the original round-26 busy-loop
+  returns). For `notRunning`/`awaitingFirstClick` entries, `backoffElapsed`
+  has no special case at all - it just naturally evaluates true for them
+  too once enough time passes, since their `consecutiveFailures` never
+  advances past 0 - so they're never actually excluded from a real
+  re-resolve, just given a slower cadence. The comment now says this
+  explicitly instead of overclaiming an exact match everywhere.
+- `RecomputeLayoutPlan`'s staleness-check comment claimed the
+  `FullFootprintWidth` width-comparison was "short-circuited" the same way
+  the `IsTaskListButton` class-name lookup is. It isn't, for an
+  already-covered task list button specifically: the `&&` short-circuit in
+  `widthIt != end() && std::abs(FullFootprintWidth(child) - ...)  > 0.5`
+  only protects against calling `FullFootprintWidth` for a *non*-task-list
+  child (where `widthIt` is always `end()`), not for the task list buttons
+  the whole check exists to catch a width change on - those pay for two
+  property reads (`Margin()` + `ActualWidth()`) every cheap-path pass,
+  unconditionally. Left as-is rather than adding complexity to avoid two
+  cheap reads per button; the comment now says so accurately instead of
+  claiming a short-circuit that isn't there for the case that matters.
+
+**`TaskListButtonIsRunning` now checks the HRESULT it was previously
+discarding.** If `TaskListButton_get_IsRunning_Original` ever failed
+(distinct from the symbol never resolving at all, which was already
+handled), `isRunning` stayed at its initialized `false` and the button
+got cached as `notRunning` - directly contradicting the function's own
+documented fallback contract ("assume running - i.e. don't skip
+anything") for exactly this kind of can't-tell situation. Fixed by
+checking `FAILED(...)` and returning `true` on failure, the same fallback
+already used for the symbol-not-resolved case.
+
+**`GetMonitorCenterXLocal`/`GetTaskbarWidthLocal` now snapshot
+`g_hTaskbarWnd`** into a local, matching the variable's own documented
+contract - the same fix `EnsureTaskbarWnd` got in round 29's optional
+items, extended to the two other multi-read call sites the round 30
+review specifically named.
+
+**`trackWindowPositions`'s settings description and both readme copies'
+`no system-wide event hook(s)` wording** updated from "two...hooks" to
+"a...hook," now that `EVENT_OBJECT_SHOW` is gone (removed in round 29;
+only `EVENT_OBJECT_LOCATIONCHANGE` remains system-wide - the
+`UpdateVisualStates` hook is in-process and scoped, not counted as one of
+these).
+
+**Not acted on** (both explicitly framed by the reviewer as informational,
+not requests): `SystemButtonContentWidth`'s live-toggle-safe fallback
+(round 29) assumes a hidden button keeps a non-zero outer `ActualWidth()`
+via the negative-margin collapse trick specifically - if some future
+Windows build ever hides one by genuinely collapsing it (`ActualWidth()`
+also going to 0), the cached last-known width would be returned instead
+and the reserved gap next to Start would never collapse. Worth knowing as
+the failure mode if that specific visual bug is ever reported, not
+something to defend against speculatively today. Similarly, the
+single-miss click-sentinel latch (round 29) costing position tracking for
+the rest of the session with only a `Wh_Log` line to explain it is a
+known, deliberate tradeoff already reasoned through at length above - the
+reviewer flagged it only as "worth knowing," not asking for a change.

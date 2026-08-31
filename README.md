@@ -33,7 +33,7 @@ right next to Start on whichever side you prefer.
 The window-tracking behind position-based splitting and drag-follow can be
 turned off entirely with `trackWindowPositions`, if you'd rather keep just
 the centered Start button and system-button placement with no background
-probing of taskbar buttons and no system-wide event hooks - every app is
+probing of taskbar buttons and no system-wide event hook - every app is
 then classified the same way as a pinned-but-not-running one instead.
 
 ## Known limitations (please read before reporting issues)
