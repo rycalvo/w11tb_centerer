@@ -1,4 +1,4 @@
-# Centered Start button with position-split taskbar icons Mod for Windhawk
+# Taskbar Start Button Centered Origin Mod for Windhawk
 
 Pins the Windows/Start button to the exact horizontal center of the primary
 monitor, regardless of how many taskbar icons are present. Running-app
@@ -123,10 +123,11 @@ then classified the same way as a pinned-but-not-running one instead.
   removes taskbar buttons rather than just repositioning them). As a
   further safeguard, the very first such probe of a session is held back
   until a real (non-sentinel) click has been seen passing through the same
-  interception point, and any single miss after that latches this mod's
-  probing off entirely on that path (see `Wh_Log` for which) - so a
-  running app's icon may briefly show on its default side, rather than by
-  window position, until you click any taskbar button once. That gate
+  interception point, and three misses on a path that has never once
+  succeeded latch this mod's probing off entirely on that path (see
+  `Wh_Log` for which) - so a running app's icon may briefly show on its
+  default side, rather than by window position, until you click any
+  taskbar button once. That gate
   only covers *before* interception is ever confirmed working, though: if
   a future Windows update breaks interception in a way that still lets a
   probe reach the taskbar's real click handler afterward, the probe's

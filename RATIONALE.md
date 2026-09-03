@@ -2107,3 +2107,115 @@ crowded taskbar is an edge case, and the suggested change (a new
 compression floor plus a decision about what happens to icons past it)
 is new design surface, not a fix to something broken, the same
 reasoning round 25 used to decline reshaping this same fallback.
+
+## Round 32: making the poll idle-cheap, and unwinding a latch that outlived its reasoning
+
+Round 32 confirmed CI green on all three targets and all four earlier
+blocking items genuinely fixed, and left two required findings.
+
+**Finding 1: the drag-follow poll ran at 150 ms forever.** Round 31
+replaced a desktop-wide WinEventHook with a fixed 150 ms poll, which
+traded a cost imposed on every process for ~6.7 wakeups/second in
+explorer.exe that never stopped — including with nothing tracked, with
+the click-sentinel path latched off, and with the machine idle. The
+reviewer noted that sub-second timers in the shell get pushed back on
+consistently in this repo, and this was worse than the 500-750 ms cases
+that had drawn objections before. (This was flagged as a known tradeoff
+when round 31 shipped, with the mitigation already identified; it came
+back exactly as expected.)
+
+Fixed with an adaptive cadence rather than the reviewer's first
+suggestion of an `EVENT_SYSTEM_MOVESIZEEND` hook.
+`DragFollowPollTimerProc` now runs at `kDragFollowPollActiveMs` (150 ms)
+while anything is moving, and drops to `kDragFollowPollIdleMs` (1 s)
+once `kDragFollowActiveWindowMs` (2 s) has passed with no detected
+change; any change snaps it straight back. A drag produces a change on
+nearly every tick, so the fast rate covers the whole drag and its
+settle, while an ordinary desktop — which is where the machine sits
+essentially all of the time — pays one wakeup per second. Nothing is
+missed at the idle rate: it does the same comparison per tracked window,
+so a new drag is picked up within one idle interval. The empty-`tracked`
+case the reviewer called out falls out of this for free, since "nothing
+tracked" is just a special case of "nothing changed."
+
+`MOVESIZEEND` was considered and rejected on three counts. It would
+reintroduce a desktop-wide WinEventHook one round after removing the
+last one; it only fires when a drag *finishes*, so icons would stop
+following live mid-drag (a visible regression against the behavior just
+tested); and by the reviewer's own caveat it misses programmatic moves
+(`Win`+arrow snap, third-party window managers), so it needs a backstop
+poll anyway — leaving two mechanisms where the adaptive poll needs one.
+The volume argument for it is sound, but it buys nothing the adaptive
+poll doesn't already get more simply.
+
+**Finding 2: `kClickSentinelMissesBeforeBroken = 1` permanently disabled
+position tracking on a single miss.** The threshold of 1 was justified,
+several rounds ago, by "with zero evidence yet that interception works, a
+single miss is reason enough." Round 30 quietly invalidated that: hoisting
+the `g_realTaskbarClickObserved` check to the top of
+`ResolveHwndFromTaskListButton` (the sole caller of both resolve paths)
+means no probe can run until a real click has already passed through
+`CTaskListWnd_HandleClick_Hook` — so by the time any probe happens, the
+hook is provably installed and provably reached. A miss after that isn't
+evidence of a broken interception point; it's the same transient class
+this file already calls "usually innocent" for post-confirmation misses,
+and the first probes of a session are when those transients are most
+likely, since buttons are still realizing. The consequence of getting it
+wrong was severe and silent: every running app falls back to
+`unresolvedAppsDefaultSide`, the whole task list piles onto one side of
+Start, and nothing recovers short of reloading the mod. Round 31's own
+live test showed the scenario — a taskbar rebuild produced `fail=9` in
+one pass; those were post-confirmation so nothing latched, but the same
+churn arriving before a path's first capture would have killed tracking
+for the session.
+
+Raised to 3, which keeps the fail-closed guarantee (three stray clicks
+per path worst case, still bounded, still well short of a runaway) while
+making an accidental permanent latch on startup churn much less likely.
+A successful capture now also zeroes that path's miss counter. That
+second half is belt-and-suspenders as the code stands, since
+`NoteUnconfirmedClickSentinelMiss` already stops counting once
+`Confirmed` is set and a capture is exactly what sets it — but it makes
+"counts consecutive unconfirmed misses" true of the counter on its own
+rather than only of the two flags read together, which is what the
+constant's name claims.
+
+**Optional items taken:** the per-call `MonitorFromWindow`/
+`GetMonitorInfo` pair in `ClassifyByWindowPositionCached` is now resolved
+once per plan recompute in `RecomputeLayoutPlan` and threaded down
+through `PlanTaskListButtons`/`ClassifyTaskListButton` as a
+`const MONITORINFO*` (null preserves the old per-call failure behavior
+exactly — fall back to the default side); `EnsureTaskbarWnd`'s
+`EnumWindows` retry is throttled to `kTaskbarWndEnumRetryMs` while the
+taskbar window is unresolved, instead of enumerating every top-level
+window on the desktop at layout frequency; `TaskListButtonIsRunning`
+now credits `taskbar-labels.wh.cpp`, which it was adapted from, the way
+this file's other borrowed techniques already are; the readme heading
+now matches the mod's `@name` instead of being a second name for the
+same thing in the same file; and the comment blocks the reviewer named
+were trimmed to keep their conclusions and drop the deliberation, with
+the duplicated nested-Arrange crash argument reduced to a
+cross-reference at its second site. Note the tension with round 31, which
+required *inlining* reasoning for self-containment: these are
+reconcilable, since self-contained means "don't point at an external doc
+for the decision," not "state the same decision in three places."
+
+**Not acted on:** removing the diagnostics scaffolding
+(`ResolveStats`/`LayoutPlanStats`/`ArrangePassStats` and the periodic
+`Wh_Log`) — declined in an earlier round with reasoning that still
+stands, and this round's own drag-follow verification was read directly
+off that log line. And gating the `UpdateVisualStates` nudge per button
+via `(void**)pThis + 3`: it would introduce a new hardcoded ABI-offset
+assumption, of the kind this file otherwise only takes on where a
+symbol can't provide the answer, to optimize a path that is already
+cheap.
+
+**Also worth recording from this round's functionality notes:** the
+reviewer pushed back *in the mod's favor* on the unattended-probing
+question the PR description flags. `taskbar-numberer` is merged in the
+catalog and fires the same click-sentinel probe from its own
+`TaskListButton::UpdateVisualStates` hook, for every button, with no
+confirmation gate, no broken-path latch and no backoff at all. Against
+that precedent this mod's version is the more conservative design, not
+the riskier one — worth weighing it against that rather than against the
+gesture-only mods the description currently cites.
