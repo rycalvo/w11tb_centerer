@@ -2219,3 +2219,26 @@ confirmation gate, no broken-path latch and no backoff at all. Against
 that precedent this mod's version is the more conservative design, not
 the riskier one — worth weighing it against that rather than against the
 gesture-only mods the description currently cites.
+
+**Caught in a self-review afterwards, before the next round:**
+`SetDragFollowPollInterval` discarded `SetTimer`'s return value. That was
+survivable when the poll timer was armed exactly once at thread startup,
+but the adaptive cadence turns it into a call that fires on every
+transition between the fast and idle rates — many times a session. Killing
+the old timer first and then failing to arm the replacement would store
+`0` as the new id and leave no timer running at all, and since the poll
+callback is this function's only repeat caller, nothing would ever run to
+retry: drag-follow silently and permanently dead for the session, with no
+log. That is precisely the failure shape this same round's finding 2
+objected to in the click-sentinel latch, reintroduced elsewhere by the fix
+for finding 1.
+
+Fixed by inverting the order — arm the replacement first, and only kill
+the old one once the new id is known good. A failure now leaves the
+previous timer running, so the poll continues at the old cadence and
+retries the switch on its next tick, which makes the failure both
+non-fatal and self-healing rather than terminal. The two timers overlap
+for the instant between the calls, costing at worst one extra poll pass.
+The failure is also logged now. A failure on the very first arm (at thread
+startup) still means no drag-follow, unchanged from before the adaptive
+cadence existed, but it is no longer silent.
