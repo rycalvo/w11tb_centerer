@@ -2242,3 +2242,32 @@ for the instant between the calls, costing at worst one extra poll pass.
 The failure is also logged now. A failure on the very first arm (at thread
 startup) still means no drag-follow, unchanged from before the adaptive
 cadence existed, but it is no longer silent.
+
+## After the merge: 1.0.0
+
+The mod was merged into `ramensoftware/windhawk-mods` on 2026-09-05 at the
+exact head the final review saw, with no maintainer edits, and is now
+published in the Windhawk catalog. Version bumped `0.1.0` → `1.0.0` to
+reflect that — and from here the version field is load-bearing rather than
+decorative, since Windhawk propagates updates to already-installed users by
+version number. A fix that ships without a bump reaches nobody.
+
+The one substantive change in 1.0.0 is the `kArmResolveNowMsg` handler in
+`BackgroundWorkerThreadProc`, which had the same kill-then-set ordering that
+`SetDragFollowPollInterval` was fixed for a round earlier: it killed the
+resolve timer and then discarded `SetTimer`'s return, so a failure left no
+resolve timer and nothing logged. The final review raised it as an optional
+item, and it was deliberately left out at that point so the head handed to
+the human reviewer was exactly the head the review had passed — introducing
+an unreviewed change at the last step would have traded a real guarantee for
+a small one. It is fixed now, with the same arm-before-kill ordering.
+
+Worth recording that this one is genuinely less severe than the drag-follow
+case it mirrors, and the asymmetry is the interesting part: the drag-follow
+poll's only repeat caller is its own callback, so losing that timer is
+terminal, whereas the resolve timer gets re-armed from several independent
+places on the taskbar thread (a real click, an `ArrangeOverride` count
+change, a subclass install). Losing it would have meant "recovers whenever
+something unrelated happens to nudge it" rather than "never recovers." The
+fix upgrades that to "recovers on its own schedule," which is the behaviour
+the surrounding code already promises.
